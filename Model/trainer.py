@@ -3,107 +3,150 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau, LambdaLR
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score, brier_score_loss
 import numpy as np
 import time
 import copy
 import os
-import gc
+import math
 from tqdm import tqdm
 from Utils.logger import Logger
+from Configs.config import config
 
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for extreme class imbalance.
-    Reduces the relative loss for well-classified examples, focusing on hard negatives.
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.9999, warmup_steps: int = None):
+        self.model = model
+        self.decay = decay
+        self.warmup_steps = warmup_steps if warmup_steps is not None else config.model.ema_warmup_steps
+        self.step = 0
+        
+        self.shadow = {}
+        self.backup = {}
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
     
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
-    def __init__(self, alpha=0.25, gamma=2.0, pos_weight=None):
-        super().__init__()
-        self.alpha = alpha  # Weight for positive class
-        self.gamma = gamma  # Focusing parameter (higher = more focus on hard examples)
-        self.pos_weight = pos_weight
+    def _get_decay(self) -> float:
+        if self.step < self.warmup_steps:
+            return min(self.decay, (1 + self.step) / (10 + self.step))
+        return self.decay
+    
+    @torch.no_grad()
+    def update(self):
+        decay = self._get_decay()
+        self.step += 1
         
-    def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        
-        # Compute focal weights
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        focal_weight = (1 - p_t) ** self.gamma
-        
-        # Alpha weighting for class balance
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        
-        # BCE loss
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        
-        # Apply focal and alpha weights
-        focal_loss = alpha_t * focal_weight * bce_loss
-        
-        return focal_loss.mean()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+    
+    def state_dict(self):
+        return {
+            'shadow': self.shadow,
+            'step': self.step,
+            'decay': self.decay
+        }
+    
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict['shadow']
+        self.step = state_dict['step']
+        self.decay = state_dict.get('decay', self.decay)
 
 
 class AsymmetricLoss(nn.Module):
-    """
-    Asymmetric Loss - different gamma for positives and negatives.
-    Particularly effective for highly imbalanced datasets (~1% positive).
-    
-    Key idea: Apply hard negative mining (high gamma_neg) while preserving
-    all positive samples (low gamma_pos). Also add explicit pos_weight.
-    """
-    def __init__(self, gamma_neg=4, gamma_pos=0, clip=0.05, pos_weight=10.0):
+    def __init__(self, gamma_negative=None, gamma_positive=None, clip=None, reduction='mean'):
         super().__init__()
-        self.gamma_neg = gamma_neg  # Higher for hard negative mining
-        self.gamma_pos = gamma_pos  # 0 = don't down-weight any positives
-        self.clip = clip  # Probability margin for negative samples
-        self.pos_weight = pos_weight  # Explicit weight for positive class
+        self.gamma_negative = gamma_negative if gamma_negative is not None else config.loss.asymmetric_gamma_negative
+        self.gamma_positive = gamma_positive if gamma_positive is not None else config.loss.asymmetric_gamma_positive
+        self.clip = clip if clip is not None else config.loss.asymmetric_clip
+        self.reduction = reduction
         
     def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        
-        # Asymmetric clipping for negatives (ignore easy negatives)
-        probs_neg = (probs + self.clip).clamp(max=1)
-        
-        # Calculate losses separately
-        loss_pos = targets * torch.log(probs.clamp(min=1e-8))
-        loss_neg = (1 - targets) * torch.log((1 - probs_neg).clamp(min=1e-8))
-        
-        # Apply different gamma - key: gamma_pos=0 keeps all positive samples
-        loss_pos = loss_pos * ((1 - probs) ** self.gamma_pos) * self.pos_weight
-        loss_neg = loss_neg * (probs_neg ** self.gamma_neg)
-        
-        loss = -loss_pos - loss_neg
-        return loss.mean()
+        probabilities = torch.sigmoid(logits)
+        probabilities_clipped = probabilities.clamp(min=self.clip)
 
-class Trainer:
-    def __init__(self, model, data_module, lr=1e-3, epochs=20, patience=5, mixed_precision=True, device=None, weight_decay=1e-5, checkpoint_dir="checkpoints", logger: Logger = None, max_grad_norm=1.0, scheduler_factor=0.3, scheduler_patience=4, min_lr=1e-6, loss_type='focal', focal_alpha=0.75, focal_gamma=2.0):
+        positive_loss = targets * torch.log(probabilities_clipped.clamp(min=1e-8))
+        if self.gamma_positive > 0:
+            positive_loss = positive_loss * ((1 - probabilities) ** self.gamma_positive)
+        
+        negative_probabilities = (probabilities - self.clip).clamp(min=0)
+        negative_loss = (1 - targets) * torch.log((1 - negative_probabilities).clamp(min=1e-8))
+        if self.gamma_negative > 0:
+            negative_loss = negative_loss * (negative_probabilities ** self.gamma_negative)
+        
+        loss = -(positive_loss + negative_loss)
+        return loss.mean()
+        
+
+class Trainer: 
+    def __init__(
+        self,
+        model,
+        data_module,
+        learning_rate=1e-3,
+        epochs=50,
+        patience=10,
+        mixed_precision=False,
+        device=None,
+        weight_decay=1e-4,
+        checkpoint_dir="checkpoints",
+        logger=None,
+        max_grad_norm=1.0,
+        scheduler_type='cosine',
+        scheduler_factor=0.5,
+        scheduler_patience=5,
+        min_learning_rate=1e-6,
+        loss_type='asymmetric',
+        warmup_epochs=5,
+        use_calibration=True,
+        use_ema=True,
+        ema_decay=0.9999,
+        use_compile=False  
+    ):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True 
+            torch.backends.cuda.matmul.allow_tf32 = True  
+            torch.backends.cudnn.allow_tf32 = True
+        
         self.model = model.to(self.device)
-        self.dm = data_module
+        
+        if use_compile and hasattr(torch, 'compile'):
+            self.model = torch.compile(self.model, mode='reduce-overhead')
+            if logger:
+                logger.info("[Optimization] torch.compile enabled (reduce-overhead mode)")
+        
+        self.data_module = data_module
         self.logger = logger
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.loss_type = loss_type
-        self.optimal_threshold = 0.3  # Start lower for imbalanced data
+        self.optimal_thresholds = {}
+        self.use_calibration = use_calibration
+        self.warmup_epochs = warmup_epochs
+        self.scheduler_type = scheduler_type
+        self.learning_rate = learning_rate
         
-        # Loss function selection for imbalanced data
-        if loss_type == 'focal':
-            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-            if self.logger:
-                self.logger.info(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma})")
-        elif loss_type == 'asymmetric':
-            # Tuned for extreme imbalance (~1% positive)
-            self.criterion = AsymmetricLoss(gamma_neg=4, gamma_pos=0, clip=0.05, pos_weight=15.0)
-            if self.logger:
-                self.logger.info("Using Asymmetric Loss (gamma_neg=4, gamma_pos=0, pos_weight=15)")
-        else:
-            self.criterion = nn.BCEWithLogitsLoss()
-            if self.logger:
-                self.logger.info("Using standard BCE Loss")
-        
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.criterion = AsymmetricLoss()
+        self.logger.info(f"[Loss] Asymmetric Loss (ASL) with γ_neg={config.loss.asymmetric_gamma_negative}, γ_pos={config.loss.asymmetric_gamma_positive}")
+               
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.epochs = epochs
         self.patience = patience
         self.mixed_precision = mixed_precision
@@ -112,72 +155,59 @@ class Trainer:
         
         self.scheduler_factor = scheduler_factor
         self.scheduler_patience = scheduler_patience
-        self.min_lr = min_lr
+        self.min_learning_rate = min_learning_rate
         self.scheduler = None
-
-    def load_checkpoint(self, path):
-        if os.path.isfile(path):
-            if self.logger:
-                self.logger.info(f"Loading checkpoint from {path}")
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            return checkpoint.get('epoch', 0), checkpoint.get('best_metric', 0)
-        else:
-            if self.logger:
-                self.logger.info(f"No checkpoint found at {path}")
-            return 0, 0
-
+        
+        self.use_ema = use_ema
+        self.ema = None
+        if use_ema:
+            self.ema = EMA(self.model, decay=ema_decay)
+            self.logger.info(f"[EMA] Exponential Moving Average enabled (decay={ema_decay}, warmup={config.model.ema_warmup_steps} steps)")
+        
     def save_checkpoint(self, epoch, metric, is_best=False):
         state = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_metric': metric,
+            'optimal_thresholds': self.optimal_thresholds,
+            'ema_state_dict': self.ema.state_dict() if self.ema else None,
         }
-      
+        
         last_path = os.path.join(self.checkpoint_dir, 'last_checkpoint.pth')
         torch.save(state, last_path)
         
         if is_best:
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
             torch.save(state, best_path)
-            if self.logger:
-                self.logger.info(f"New best model saved to {best_path} with AUC: {metric:.4f}")
-
-    def log_model_internals(self, epoch):
-        if not self.logger:
-            return
             
-        for name, param in self.model.named_parameters():
-            self.logger.log_histogram(f"Weights/{name}", param, epoch)
-            if param.grad is not None:
-                self.logger.log_histogram(f"Gradients/{name}", param.grad, epoch)
-
+            if self.ema:
+                ema_path = os.path.join(self.checkpoint_dir, 'best_model_ema.pth')
+                self.ema.apply_shadow()
+                torch.save(self.model.state_dict(), ema_path)
+                self.ema.restore()
+            
+            if self.logger:
+                self.logger.info(f"[Checkpoint] New best model saved → AUC: {metric:.4f}")
+    
     def train_epoch(self, dataloader, epoch):
         self.model.train()
-        total_loss = 0
-        n_pos, n_total = 0, 0
+        running_loss = torch.tensor(0.0, device=self.device)
+        num_batches = 0
+        log_interval = 50  
         
         loop = tqdm(dataloader, desc=f"Train Epoch {epoch}")
-        for batch_idx, (x_cat, x_cont, y) in enumerate(loop):
-            x_cat, x_cont, y = x_cat.to(self.device), x_cont.to(self.device), y.to(self.device)
-            
-            self.optimizer.zero_grad(set_to_none=True)  # More memory efficient
+        for batch_index, (categorical_features, continuous_features, targets, lengths) in enumerate(loop):
+            categorical_features = categorical_features.to(self.device, non_blocking=True)
+            continuous_features = continuous_features.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            lengths = lengths.to(self.device, non_blocking=True)
+            self.optimizer.zero_grad(set_to_none=True)
             
             with autocast(device_type=self.device.type, enabled=self.mixed_precision and self.device.type == 'cuda'):
-                logits = self.model(x_cat, x_cont)
-                
-                # Single target output
-                target = y.view(-1, 1) if y.dim() == 1 else y[:, 0].unsqueeze(1)
-                
-                # Track class balance in batch
-                n_pos += target.sum().item()
-                n_total += target.numel()
-                
-                # Use configured loss (Focal/Asymmetric/BCE)
-                loss = self.criterion(logits, target)
+                logits = self.model(categorical_features, continuous_features, lengths)
+                target_tensor = targets.view(-1, len(config.columns.target_cols))
+                loss = self.criterion(logits, target_tensor)
             
             if self.scaler:
                 self.scaler.scale(loss).backward()
@@ -185,286 +215,280 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-            
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
             
-            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.ema:
+                self.ema.update()
             
-            total_loss += loss.item()
-            loop.set_postfix(loss=loss.item(), lr=current_lr)
+            running_loss += loss.detach()
+            num_batches += 1
+           
+            if num_batches % log_interval == 0:
+                current_learning_rate = self.optimizer.param_groups[0]['lr']
+                loop.set_postfix(loss=f"{(running_loss / num_batches).item():.4f}", lr=f"{current_learning_rate:.2e}")
             
-            # Clean up batch tensors
-            del x_cat, x_cont, y, logits, target, loss
         
-        avg_loss = total_loss / len(dataloader)
-        pos_rate = n_pos / n_total if n_total > 0 else 0
         
+        average_loss = (running_loss / max(num_batches, 1)).item()
         if self.logger:
-            self.logger.log_scalar("Train/Loss", avg_loss, epoch)
-            self.logger.log_scalar("Train/PositiveRate", pos_rate, epoch)
-            self.log_model_internals(epoch)
-            
-        return avg_loss
-
-    def find_optimal_threshold(self, targets, predictions):
-        precision, recall, thresholds = precision_recall_curve(targets, predictions)
-        f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
-        best_idx = np.argmax(f1_scores)
-        optimal_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
-        return optimal_threshold, f1_scores[best_idx]
-
-    def validate(self, dataloader, epoch):
+            self.logger.log_scalar("Loss/train", average_loss, epoch)
+            self.logger.log_scalar("LR", self.optimizer.param_groups[0]['lr'], epoch)
+        return average_loss
+    
+    @torch.no_grad()
+    def evaluate(self, dataloader, epoch=None, phase="val", use_ema=True):
+        if use_ema and self.ema:
+            self.ema.apply_shadow()
+        
         self.model.eval()
-        total_loss = 0
-        all_preds = []
-        all_targets = []
         
-        loop = tqdm(dataloader, desc=f"Val Epoch {epoch}")
-        with torch.no_grad():
-            for x_cat, x_cont, y in loop:
-                x_cat, x_cont, y = x_cat.to(self.device), x_cont.to(self.device), y.to(self.device)
-                
-                logits = self.model(x_cat, x_cont)
-                target = y.view(-1, 1) if y.dim() == 1 else y[:, 0].unsqueeze(1)
-                
-                loss = self.criterion(logits, target)
-
-                total_loss += loss.item()
-                loop.set_postfix(loss=loss.item())
-                
-                all_preds.extend(torch.sigmoid(logits).view(-1).cpu().numpy())
-                all_targets.extend(target.view(-1).cpu().numpy())
-
-        avg_loss = total_loss / len(dataloader)
-        all_preds = np.array(all_preds)
-        all_targets = np.array(all_targets)
+        # Collect as lists of tensors, convert at end (more efficient)
+        all_probabilities = []
+        all_targets_list = []
         
-
-        try:
-            roc_auc = roc_auc_score(all_targets, all_preds)
-            pr_auc = average_precision_score(all_targets, all_preds)
-            self.optimal_threshold, best_f1 = self.find_optimal_threshold(all_targets, all_preds)
-            preds_binary = (all_preds >= self.optimal_threshold).astype(int)
-            f1 = f1_score(all_targets, preds_binary, zero_division=0)
+        running_loss = torch.tensor(0.0, device=self.device)
+        num_batches = 0
+        
+        for categorical_features, continuous_features, targets, lengths in dataloader:
+            categorical_features = categorical_features.to(self.device, non_blocking=True)
+            continuous_features = continuous_features.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            lengths = lengths.to(self.device, non_blocking=True)
             
-            tp = ((preds_binary == 1) & (all_targets == 1)).sum()
-            fp = ((preds_binary == 1) & (all_targets == 0)).sum()
-            fn = ((preds_binary == 0) & (all_targets == 1)).sum()
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
+            logits = self.model(categorical_features, continuous_features, lengths)
+            target_tensor = targets.view(-1, len(config.columns.target_cols))
             
-        except Exception as e:
-            roc_auc, pr_auc, f1, precision, recall = 0.5, 0.0, 0.0, 0.0, 0.0
-            self.optimal_threshold = 0.5
-        
-        aucs = {'default': pr_auc}  
-        
-        if self.logger:
-            self.logger.log_scalar("Val/Loss", avg_loss, epoch)
-            self.logger.log_scalar("Val/ROC_AUC", roc_auc, epoch)
-            self.logger.log_scalar("Val/PR_AUC", pr_auc, epoch)
-            self.logger.log_scalar("Val/F1", f1, epoch)
-            self.logger.log_scalar("Val/Precision", precision, epoch)
-            self.logger.log_scalar("Val/Recall", recall, epoch)
-            self.logger.log_scalar("Val/OptimalThreshold", self.optimal_threshold, epoch)
-            self.logger.log_histogram("Val/Predictions", all_preds, epoch)
+            loss = self.criterion(logits, target_tensor)
+            running_loss += loss.detach()
+            num_batches += 1
             
-            val_pos_rate = all_targets.mean()
-            self.logger.log_scalar("Val/PositiveRate", val_pos_rate, epoch)
+            # Keep on CPU but as tensors (avoid per-element extend)
+            all_probabilities.append(torch.sigmoid(logits).cpu())
+            all_targets_list.append(target_tensor.cpu())
         
-        return avg_loss, aucs
-
+        if use_ema and self.ema:
+            self.ema.restore()
+        
+        # Single .item() call at end instead of every batch
+        average_loss = (running_loss / max(num_batches, 1)).item()
+        
+        # Concatenate all at once and convert to numpy (much faster than extend)
+        all_probs_tensor = torch.cat(all_probabilities, dim=0).numpy()
+        all_targs_tensor = torch.cat(all_targets_list, dim=0).numpy()
+        
+        metrics = {}
+        target_names = config.columns.target_cols
+        
+        for target_index, name in enumerate(target_names):
+            predictions = all_probs_tensor[:, target_index]
+            targets_numpy = all_targs_tensor[:, target_index]
+            
+            try:
+                auc_roc = roc_auc_score(targets_numpy, predictions) if len(np.unique(targets_numpy)) > 1 else 0.5
+                auc_pr = average_precision_score(targets_numpy, predictions) if len(np.unique(targets_numpy)) > 1 else 0.0
+            except:
+                auc_roc, auc_pr = 0.5, 0.0
+            
+            if len(np.unique(targets_numpy)) > 1:
+                precisions, recalls, thresholds = precision_recall_curve(targets_numpy, predictions)
+                f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+                best_threshold_index = np.argmax(f1_scores)
+                if best_threshold_index < len(thresholds):
+                    optimal_threshold = thresholds[best_threshold_index]
+                else:
+                    optimal_threshold = 0.5
+            else:
+                optimal_threshold = np.mean(targets_numpy) if len(targets_numpy) > 0 else 0.5
+            
+            if phase == "val":
+                self.optimal_thresholds[name] = optimal_threshold
+                threshold = optimal_threshold
+            elif phase == "test" and name in self.optimal_thresholds:
+                threshold = self.optimal_thresholds[name]
+            else:
+                threshold = optimal_threshold
+            
+            predictions_binary = (predictions >= threshold).astype(int)
+            
+            f1 = f1_score(targets_numpy, predictions_binary, zero_division=0)
+            if self.logger and epoch is not None:
+                self.logger.log_scalar(f"Loss/{phase}_{name}", average_loss, epoch)
+                self.logger.log_scalar(f"AUC-ROC/{phase}_{name}", auc_roc, epoch)
+                self.logger.log_scalar(f"AUC-PR/{phase}_{name}", auc_pr, epoch)
+                self.logger.log_scalar(f"F1/{phase}_{name}", f1, epoch)
+            
+            metrics[f'{name}_auc_roc'] = auc_roc
+            metrics[f'{name}_auc_pr'] = auc_pr
+            metrics[f'{name}_f1'] = f1
+            metrics[f'{name}_threshold'] = threshold
+        
+        metrics['loss'] = average_loss
+        return metrics
+    
     def fit(self):
-        msg = f"Training on device: {self.device}"
-   
-        self.logger.info(msg)
-     
-        if self.mixed_precision and self.device.type == 'cuda':
-            self.logger.info("Mixed Precision Enabled (AMP)")
+        self.logger.section("Model Training")
+        torch.cuda.empty_cache()
+        num_parameters = sum(parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad)
         
-        train_loader = self.dm.train_dataloader()
-        val_loader = self.dm.val_dataloader()
+        self.logger.subsection("Training Configuration")
+        self.logger.experiment_config({
+            "Device": str(self.device),
+            "Trainable Parameters": f"{num_parameters:,}",
+            "Epochs": self.epochs,
+            "Learning Rate": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            "Batch Size": self.data_module.batch_size,
+            "Weight Decay": f"{self.optimizer.param_groups[0].get('weight_decay', 0):.2e}",
+            "Mixed Precision": "Enabled" if self.mixed_precision else "Disabled",
+            "EMA": f"Enabled (decay={self.ema.decay})" if self.ema else "Disabled",
+            "Gradient Clipping": f"max_norm={self.max_grad_norm}",
+        })
         
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
-            mode='max',
-            factor=self.scheduler_factor, 
-            patience=self.scheduler_patience, 
-            min_lr=self.min_lr
+        self.logger.subsection("Dataset Statistics")
+        self.logger.experiment_config({
+            "Train Samples": f"{len(self.data_module.train_indices):,}",
+            "Validation Samples": f"{len(self.data_module.validation_indices):,}",
+            "Test Samples": f"{len(self.data_module.test_indices):,}",
+        })
+
+        train_loader = self.data_module.train_dataloader()
+        validation_loader = self.data_module.validation_dataloader()
+        
+        self.scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=config.model.scheduler_t0,
+            T_mult=config.model.scheduler_t_mult,
+            eta_min=self.min_learning_rate
         )
+        self.logger.info(f"[Scheduler] CosineAnnealingWarmRestarts (T_0={config.model.scheduler_t0}, T_mult={config.model.scheduler_t_mult}, η_min={self.min_learning_rate:.2e})")
+    
+        self.logger.subsection("Training Progress")
         
         best_auc = 0
+        best_precision_recall = 0
+        best_model_state = None
+        best_ema_state = None
         patience_counter = 0
-                    
-        for epoch in range(self.epochs):
-            gc.collect()
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            
+        
+        for epoch in range(1, self.epochs + 1):
             train_loss = self.train_epoch(train_loader, epoch)
             
-            gc.collect()
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+            validation_metrics = self.evaluate(validation_loader, epoch, phase="val")
+        
+            target_names = config.columns.target_cols
+            validation_auc = np.mean([validation_metrics.get(f'{target}_auc_roc', 0.5) for target in target_names])
+            validation_f1  = np.mean([validation_metrics.get(f'{target}_f1', 0.0) for target in target_names])
+            validation_precision_recall  = np.mean([validation_metrics.get(f'{target}_auc_pr', 0.0) for target in target_names])
             
-            val_loss, aucs = self.validate(val_loader, epoch)
-
-            gc.collect()
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-    
-            avg_auc = np.mean(list(aucs.values()))
-            old_lr = self.optimizer.param_groups[0]['lr']
-            if self.scheduler:
-                self.scheduler.step(avg_auc)
-            new_lr = self.optimizer.param_groups[0]['lr']
+            if self.scheduler_type == 'cosine':
+                self.scheduler.step()
+            else:
+                self.scheduler.step(validation_precision_recall)
             
-            # Log LR after scheduler step
-            if self.logger:
-                self.logger.log_scalar("Train/LearningRate", new_lr, epoch)
-                if new_lr != old_lr:
-                    self.logger.info(f"LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
-            
-            if self.device.type == 'cuda' and self.logger:
-                allocated = torch.cuda.memory_allocated(self.device) / 1024**3
-                reserved = torch.cuda.memory_reserved(self.device) / 1024**3
-                self.logger.log_scalar("System/GPU_Allocated_GB", allocated, epoch)
-                self.logger.log_scalar("System/GPU_Reserved_GB", reserved, epoch)
-
-            avg_auc = np.mean(list(aucs.values()))
+            current_learning_rate = self.optimizer.param_groups[0]['lr']
             
             if self.logger:
-                self.logger.log_scalar("Val/Mean_AUC", avg_auc, epoch)
-            
-            is_best = avg_auc > best_auc
-            if is_best:
-                best_auc = avg_auc
-                flag = "*"
+                self.logger.log_epoch_results(
+                    epoch=epoch,
+                    total_epochs=self.epochs,
+                    train_loss=train_loss,
+                    val_loss=validation_metrics['loss'],
+                    metrics={
+                        "AUC-ROC": validation_auc,
+                        "AUC-PR": validation_precision_recall,
+                        "F1-Score": validation_f1,
+                        "LR": current_learning_rate,
+                    }
+                )
+                for target in target_names:
+                    target_auc = validation_metrics.get(f'{target}_auc_roc', 0.5)
+                    target_precision_recall = validation_metrics.get(f'{target}_auc_pr', 0.0)
+                    target_f1 = validation_metrics.get(f'{target}_f1', 0.0)
+                    target_threshold = validation_metrics.get(f'{target}_threshold', 0.5)
+                    self.logger.info(f"    {target}: AUC={target_auc:.4f} | PR={target_precision_recall:.4f} | F1={target_f1:.4f} | τ={target_threshold:.3f}")
+       
+            if validation_precision_recall > best_precision_recall:
+                best_auc = validation_auc
+                best_precision_recall = validation_precision_recall
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                best_thresholds = copy.deepcopy(self.optimal_thresholds)
+                best_ema_state = copy.deepcopy(self.ema.state_dict())
                 patience_counter = 0
-                self.save_checkpoint(epoch, best_auc, is_best=True)
+                self.save_checkpoint(epoch, validation_precision_recall, is_best=True)
+                self.logger.info(f"    ★ New Best Model: AUC-PR={validation_precision_recall:.4f}, AUC-ROC={validation_auc:.4f}")
             else:
-                flag = ""
                 patience_counter += 1
-                self.save_checkpoint(epoch, best_auc, is_best=False)
-                
-            log_msg = (f"Epoch {epoch+1}/{self.epochs} | "
-                  f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"AUC: {avg_auc:.4f} | LR: {new_lr:.2e} {flag}")
-            
-            if self.logger:
-                self.logger.info(log_msg)
-            else:
-                print(log_msg)
-                
-            if patience_counter >= self.patience:
-                if self.logger:
-                    self.logger.info(f"Early stop triggered after {epoch+1} epochs.")
-                else:
-                    print(f"Early stop triggered after {epoch+1} epochs.")
-                break
-            
-        final_msg = "Traning Complete.\n" + f"Best Mean AUC: {best_auc:.4f}"
-        if self.logger:
-            self.logger.info(final_msg)
-        else:
-            print(final_msg)
+                if patience_counter >= self.patience:
+                    self.logger.warning(f"[Early Stopping] Training halted at epoch {epoch} (patience={self.patience}). Best AUC-PR: {best_precision_recall:.4f}")
+                    break
         
-        best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
-        if os.path.exists(best_path):
-             self.load_checkpoint(best_path)
-             
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            self.optimal_thresholds = best_thresholds
+            if best_ema_state is not None:
+                self.ema.load_state_dict(best_ema_state)
+
+        if self.use_calibration and hasattr(self.model, 'calibrate_temperature'):
+            self.logger.subsection("Temperature Calibration")
+            self.logger.info("[Calibration] Performing temperature scaling on validation set")
+            
+            self.ema.apply_shadow()
+            self.model.calibrate_temperature(validation_loader, self.device)
+            
+            self.ema.restore()
+            self.logger.info("[Calibration] Temperature scaling complete")
+        
+        self.logger.log_experiment_summary(
+            best_metrics={
+                "Best AUC-ROC": best_auc,
+                "Best AUC-PR": best_precision_recall,
+            },
+            notes=f"Training completed successfully. Model checkpoints saved to {self.checkpoint_dir}"
+        )
+        
         return self.model
-
-    def test(self, dataloader):
-        self.model.eval()
-        total_loss = 0
-        all_preds = []
-        all_targets = []
+    
+    def test(self, test_loader):
+        self.logger.section("Model Evaluation on Test Set")
         
+        metrics = self.evaluate(test_loader, phase="test")
+        
+        target_names = config.columns.target_cols
+        average_auc = np.mean([metrics.get(f'{target}_auc_roc', 0.5) for target in target_names])
+        average_precision_recall  = np.mean([metrics.get(f'{target}_auc_pr', 0.0) for target in target_names])
+        average_f1  = np.mean([metrics.get(f'{target}_f1', 0.0) for target in target_names])
+        
+        metrics['avg_auc_roc'] = average_auc
+        metrics['avg_auc_pr'] = average_precision_recall
+        metrics['avg_f1'] = average_f1
+
         if self.logger:
-            self.logger.info(f"Starting Testing Phase (using threshold: {self.optimal_threshold:.4f})...")
-
-        loop = tqdm(dataloader, desc="Testing")
-        with torch.no_grad():
-            for x_cat, x_cont, y in loop:
-                x_cat, x_cont, y = x_cat.to(self.device), x_cont.to(self.device), y.to(self.device)
-                
-                logits = self.model(x_cat, x_cont)
-                target = y.view(-1, 1) if y.dim() == 1 else y[:, 0].unsqueeze(1)
-                
-                loss = self.criterion(logits, target)
-
-                total_loss += loss.item()
-                
-                all_preds.extend(torch.sigmoid(logits).view(-1).cpu().numpy())
-                all_targets.extend(target.view(-1).cpu().numpy())
-
-        avg_loss = total_loss / len(dataloader)
-        all_preds = np.array(all_preds)
-        all_targets = np.array(all_targets)
-        
-        # Calculate metrics
-        try:
-            roc_auc = roc_auc_score(all_targets, all_preds)
-            pr_auc = average_precision_score(all_targets, all_preds)
-            
-            # Use optimal threshold from validation
-            preds_binary = (all_preds >= self.optimal_threshold).astype(int)
-            f1 = f1_score(all_targets, preds_binary, zero_division=0)
-            
-            # Detailed metrics at optimal threshold
-            tp = ((preds_binary == 1) & (all_targets == 1)).sum()
-            fp = ((preds_binary == 1) & (all_targets == 0)).sum()
-            fn = ((preds_binary == 0) & (all_targets == 1)).sum()
-            tn = ((preds_binary == 0) & (all_targets == 0)).sum()
-            
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            specificity = tn / (tn + fp + 1e-8)
-            
-            # Also find test-optimal threshold for comparison
-            test_opt_threshold, test_best_f1 = self.find_optimal_threshold(all_targets, all_preds)
-            
-        except Exception as e:
-            roc_auc, pr_auc, f1, precision, recall, specificity = 0.5, 0.0, 0.0, 0.0, 0.0, 0.0
-            test_opt_threshold, test_best_f1 = 0.5, 0.0
-        
-        aucs = {'default': pr_auc}
-        
-        # Positive rate in test set
-        test_pos_rate = all_targets.mean()
-        
-        if self.logger:
-            self.logger.log_scalar("Test/Loss", avg_loss, 0)
-            self.logger.log_scalar("Test/ROC_AUC", roc_auc, 0)
-            self.logger.log_scalar("Test/PR_AUC", pr_auc, 0)
-            self.logger.log_scalar("Test/F1", f1, 0)
-            self.logger.log_scalar("Test/Precision", precision, 0)
-            self.logger.log_scalar("Test/Recall", recall, 0)
-            self.logger.log_histogram("Test/Predictions", all_preds, 0)
-             
-            results_msg = (
-                f"\n{'='*50}\n"
-                f"TEST RESULTS (Extreme Imbalance: {test_pos_rate*100:.2f}% positive)\n"
-                f"{'='*50}\n"
-                f"  Loss:       {avg_loss:.4f}\n"
-                f"  ROC AUC:    {roc_auc:.4f}\n"
-                f"  PR AUC:     {pr_auc:.4f} (key metric for imbalanced data)\n"
-                f"{'='*50}\n"
-                f"At Val-Optimal Threshold ({self.optimal_threshold:.4f}):\n"
-                f"  F1 Score:   {f1:.4f}\n"
-                f"  Precision:  {precision:.4f}\n"
-                f"  Recall:     {recall:.4f}\n"
-                f"  Specificity:{specificity:.4f}\n"
-                f"  TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}\n"
-                f"{'='*50}\n"
-                f"Test-Optimal Threshold: {test_opt_threshold:.4f} (F1={test_best_f1:.4f})\n"
-                f"{'='*50}"
+            self.logger.log_evaluation_results(
+                dataset_name="Test Set",
+                metrics={
+                    "Average AUC-ROC": average_auc,
+                    "Average AUC-PR": average_precision_recall,
+                    "Average F1-Score": average_f1,
+                    "Loss": metrics['loss'],
+                }
             )
-            self.logger.info(results_msg)
+            
+            test_rows = []
+            for target in target_names:
+                test_rows.append([
+                    target,
+                    f"{metrics.get(f'{target}_auc_roc', 0):.4f}",
+                    f"{metrics.get(f'{target}_auc_pr', 0):.4f}",
+                    f"{metrics.get(f'{target}_f1', 0):.4f}",
+                    f"{metrics.get(f'{target}_threshold', 0.5):.3f}"
+                ])
+            
+            self.logger.metrics_table(
+                headers=["Target", "AUC-ROC", "AUC-PR", "F1-Score", "Threshold"],
+                rows=test_rows,
+                title="Per-Target Test Results"
+            )
         
-        return aucs
+        return metrics
