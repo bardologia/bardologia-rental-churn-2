@@ -6,8 +6,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
-from Configs.config import config
-from Utils.logger import Logger
+from configs.config import config
+from utils.logger import Logger
 
 
 class Augmentation:
@@ -144,14 +144,7 @@ class DataModule:
         self.min_sequence_length = min_sequence_length
         
         if logger is None:
-            self.logger = logging.getLogger("DataModule")
-            if not self.logger.handlers:
-                handler = logging.StreamHandler()
-                handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-                self.logger.addHandler(handler)
-                self.logger.setLevel(logging.INFO)
-        else:
-            self.logger = logger
+            self.logger = Logger(log_dir="logs/data_module", name="DataModule", enable_tensorboard=False)
         
         self.categorical_columns = config.columns.cat_cols
         self.continuous_columns = config.columns.cont_cols

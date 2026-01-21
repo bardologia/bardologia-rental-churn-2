@@ -9,7 +9,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Configs.config import config, Config, PathsDetails, DataParams, ModelParams
+from configs.config import config, Config, PathsDetails, DataParams, ModelParams
 
 
 class TestConfigStructure:

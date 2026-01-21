@@ -12,8 +12,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Model.core import Preprocessor, FeatureEngineer
-from Configs.config import config
+from model.core import Preprocessor, FeatureEngineer
+from configs.config import config
 
 
 class TestPreprocessor:

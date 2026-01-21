@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
-from Configs.config import config
+from configs.config import config
 
 
 class StochasticDepth(nn.Module):

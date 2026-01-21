@@ -18,12 +18,12 @@ torch.autograd.profiler.emit_nvtx(enabled=False)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(current_dir, '..')))
 
-from Model.core import DataPipeline
-from Model.data import DataModule
-from Model.network import Model
-from Model.trainer import Trainer
-from Configs.config import config
-from Utils.logger import Logger
+from model.core import DataPipeline
+from model.data import DataModule
+from model.network import Model
+from model.trainer import Trainer
+from configs.config import config
+from utils.logger import Logger
 
 
 def main(enable_profiler: bool = False):

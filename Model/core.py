@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
-from Configs.config import config
+from configs.config import config
 
 
 class Preprocessor:  

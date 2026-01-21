@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from Configs.config import config
+from configs.config import config
 
 
 @pytest.fixture

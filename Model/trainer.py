@@ -11,8 +11,8 @@ import copy
 import os
 import math
 from tqdm import tqdm
-from Utils.logger import Logger
-from Configs.config import config
+from utils.logger import Logger
+from configs.config import config
 
 
 class EMA:
