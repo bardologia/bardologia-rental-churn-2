@@ -13,10 +13,11 @@ torch.autograd.profiler.emit_nvtx(enabled=False)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(current_dir, '..')))
 
-from model.core import DataPipeline
-from model.tuner import OptunaTuner
-from configs.config import config
-from utils.logger import Logger
+from core.data import DataPipeline
+from core.tuner import OptunaTuner
+from core.config import config
+from core.logger import Logger
+from core.dataset import DatasetLoader
 
 
 def main():
@@ -42,14 +43,20 @@ def main():
     logger.info(f"[Config] Max epochs per trial: {config.optuna.max_epochs}")
     logger.info(f"[Config] Early stopping patience: {config.optuna.early_stopping_patience}")
     
-    tuner = OptunaTuner(data_path=data_path, project_root=project_root)
+    data_module = DatasetLoader(data_path)
+        
+    train_loader, validation_loader, test_loader = data_module.dataloader_pipeline()
+    
+    target_scaler = data_module.target_scalers["target_days_to_payment"]
+    continuous_scalers = data_module.continuous_scalers
+
+    tuner = OptunaTuner(data_path=data_path, project_root=project_root, train_loader=train_loader, val_loader=validation_loader, target_scaler=target_scaler, feature_scaler=continuous_scalers)
     
     best_params, best_value = tuner.optimize()
     
     logger.section("Tuning Results")
-    logger.info(f"[Results] Best AUC achieved: {best_value:.4f}")
-    logger.info("[Results] Best parameters saved to: Runs/optuna_results/best_params_*.json")
-    logger.info("[Results] Use these parameters in config.py for final training")
+    logger.info(f"[Tuning] Best Parameters: {best_params}")
+    logger.info(f"[Tuning] Best Validation Value: {best_value}")
     logger.close()
 
 
