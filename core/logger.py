@@ -19,7 +19,8 @@ class Logger:
         self.log_dir = log_dir
         self.name = name
         self.start_time = datetime.now()
-        os.makedirs(self.log_dir, exist_ok=True)
+        if log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
         
         self.logger = logging.getLogger(name)
         
@@ -39,10 +40,11 @@ class Logger:
         )
         
         log_filename = f'{name}_{self.start_time.strftime("%Y%m%d_%H%M%S")}.log'
-        file_handler = logging.FileHandler(os.path.join(self.log_dir, log_filename), encoding='utf-8')
-        file_handler.setFormatter(file_formatter)
-        file_handler.setLevel(log_level)
-        self.logger.addHandler(file_handler)
+        if log_dir:
+            file_handler = logging.FileHandler(os.path.join(self.log_dir, log_filename), encoding='utf-8')
+            file_handler.setFormatter(file_formatter)
+            file_handler.setLevel(log_level)
+            self.logger.addHandler(file_handler)
     
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(console_formatter)
@@ -51,7 +53,7 @@ class Logger:
         
         self.enable_tensorboard = enable_tensorboard
         self.writer = None
-        if enable_tensorboard:
+        if enable_tensorboard and log_dir:
             tensorboard_dir = os.path.join(self.log_dir, 'tensorboard')
             self.writer = SummaryWriter(log_dir=tensorboard_dir)
         
@@ -60,7 +62,8 @@ class Logger:
     def _log_experiment_header(self):
         self.logger.info(f"[Experiment] {self.name}")
         self.logger.info(f"[Start] {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self.logger.info(f"[Log Dir] {os.path.abspath(self.log_dir)}")
+        if self.log_dir:
+            self.logger.info(f"[Log Dir] {os.path.abspath(self.log_dir)}")
         if self.enable_tensorboard:
             self.logger.info(f"[TensorBoard] Enabled")
 

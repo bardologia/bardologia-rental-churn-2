@@ -23,7 +23,7 @@ from core.dataset import DatasetLoader
 def main():
     project_root = current_dir
     
-    run_dir = os.path.join(project_root, "Runs", "optuna_tuning")
+    run_dir = os.path.join(project_root, config.paths.runs_dir, config.paths.optuna_tuning_dir)
     logger = Logger(log_dir=run_dir, name="OptunaTuning")
     
     raw_path = os.path.join(project_root, config.paths.raw_data)
@@ -47,7 +47,7 @@ def main():
         
     train_loader, validation_loader, test_loader = data_module.dataloader_pipeline()
     
-    target_scaler = data_module.target_scalers["target_days_to_payment"]
+    target_scaler = data_module.target_scalers[config.columns.target_col_name]
     continuous_scalers = data_module.continuous_scalers
 
     tuner = OptunaTuner(data_path=data_path, project_root=project_root, train_loader=train_loader, val_loader=validation_loader, target_scaler=target_scaler, feature_scaler=continuous_scalers)

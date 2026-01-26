@@ -9,7 +9,7 @@ from core.logger import Logger
 
 class Preprocessor:  
     def __init__(self):
-        self.logger = Logger(name="Preprocessor", level="INFO")
+        self.logger = Logger(name="Preprocessor", level="INFO", log_dir=None)
     
     def filter_category(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         category_col = config.columns.category_col
@@ -57,7 +57,7 @@ class Preprocessor:
 class FeatureEngineer:
        
     def __init__(self):
-        self.logger = Logger(name="FeatureEngineer", level="INFO")
+        self.logger = Logger(name="FeatureEngineer", level="INFO", log_dir=None)
     
     def create_temporal_features(self, dataframe: pd.DataFrame) -> pd.DataFrame: 
         due_date_col = config.columns.due_date_col
@@ -121,20 +121,20 @@ class FeatureEngineer:
         dataframe = dataframe.sort_values(sort_cols).reset_index(drop=True)
         
         dataframe['seq_position']            = dataframe.groupby(user_col).cumcount()
-        dataframe['seq_total']               = dataframe.groupby(user_col)[user_col].transform('count')
+        dataframe['seq_total']               = dataframe.groupby(user_col)[user_col].transform(lambda s: s.expanding().count())
         dataframe['seq_position_norm']       = dataframe['seq_position'] / dataframe['seq_total'].clip(lower=1)
         dataframe['is_first_invoice']        = (dataframe['seq_position'] == 0).astype(int)
             
         dataframe['days_since_last_invoice'] = dataframe.groupby(user_col)[due_date_col].diff().dt.days.fillna(0)
     
-        dataframe['rolling_mean_delay_3']    = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(3, min_periods=1).mean().shift(1)).fillna(0).clip(lower=0)
-        dataframe['rolling_max_delay_3']     = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(3, min_periods=1).max().shift(1)).fillna(0).clip(lower=0)
-        dataframe['rolling_mean_delay_5']    = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(5, min_periods=1).mean().shift(1)).fillna(0).clip(lower=0)
-        dataframe['rolling_max_delay_5']     = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(5, min_periods=1).max().shift(1)).fillna(0).clip(lower=0)
+        for window_size in config.data.rolling_window_sizes:
+            dataframe[f'rolling_mean_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).mean().shift(1)).fillna(0).clip(lower=0)
+            dataframe[f'rolling_max_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).max().shift(1)).fillna(0).clip(lower=0)
 
         dataframe['is_improving']            = (dataframe['delay_trend'] < 0).astype(int) if 'delay_trend' in dataframe.columns else 0
         dataframe['parcela_position']        = dataframe.groupby([user_col, contract_col]).cumcount()
-        dataframe['parcela_total']           = dataframe.groupby([user_col, contract_col])[order_col].transform('count')
+
+        dataframe['parcela_total']           = dataframe.groupby([user_col, contract_col])[order_col].transform(lambda s: s.expanding().count())
         dataframe['parcela_position_norm']   = dataframe['parcela_position'] / dataframe['parcela_total'].clip(lower=1)
         
         first_in_contract = dataframe.groupby([user_col, contract_col]).cumcount().eq(0).astype(int)
@@ -158,6 +158,7 @@ class FeatureEngineer:
         dataframe = dataframe.sort_values(sort_cols).reset_index(drop=True)
         
         dataframe['total_paid']      = (dataframe.groupby(user_col)[payed_value_col].transform(lambda s: s.expanding().sum().shift(1)).fillna(0))
+  
         dataframe['total_billed']    = (dataframe.groupby(user_col)[billed_value_col].transform(lambda s: s.expanding().sum()).fillna(0))
         dataframe['hist_mean_value'] = dataframe.groupby(user_col)[billed_value_col].transform(lambda values: values.expanding().mean().shift(1)).clip(lower=0)
         dataframe['value_ratio']     = dataframe[billed_value_col] / dataframe['hist_mean_value']
@@ -167,10 +168,10 @@ class FeatureEngineer:
 
     def create_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         delay_col = config.columns.delay_col
-        target_col = 'target_days_to_payment'
-        dataframe['delay_clipped'] = dataframe[delay_col].clip(lower=0)
-        dataframe['delay_is_known'] = 1 
-        dataframe['target_days_to_payment'] = dataframe['delay_clipped']
+        target_col = config.columns.target_col_name
+        dataframe[config.columns.delay_clipped_col] = dataframe[delay_col].clip(lower=0)
+        dataframe[config.columns.delay_is_known_col] = config.data.delay_is_known_value
+        dataframe[config.columns.target_col_name] = dataframe[config.columns.delay_clipped_col]
         self.logger.info(f"[Target Creation] Created target column: {target_col} from {delay_col} \n")
         return dataframe
 
@@ -196,7 +197,7 @@ class FeatureEngineer:
 
 class DataPipeline:
     def __init__(self):
-        self.logger = Logger(name="DataPipeline", level="INFO")
+        self.logger = Logger(name="DataPipeline", level="INFO", log_dir=None)
         self.preprocessor = Preprocessor()
         self.feature_engineer = FeatureEngineer()
     

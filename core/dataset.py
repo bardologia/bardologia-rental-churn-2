@@ -7,13 +7,15 @@ from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
 
-from core.config import config
-from core.logger import Logger
+from .config import config
+from .logger import Logger
 
 
 class Augmentation:
     @staticmethod
-    def temporal_cutout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = 0.1) -> tuple:
+    def temporal_cutout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
+        if probability is None:
+            probability = config.augmentation.default_probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
             
@@ -33,7 +35,9 @@ class Augmentation:
         return categorical_augmented, continuous_augmented
     
     @staticmethod
-    def feature_dropout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = 0.1) -> tuple:
+    def feature_dropout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
+        if probability is None:
+            probability = config.augmentation.default_probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
         
@@ -53,7 +57,11 @@ class Augmentation:
         return categorical_augmented, continuous_augmented
     
     @staticmethod
-    def gaussian_noise(continuous_features: torch.Tensor, probability: float = 0.1, standard_deviation: float = 0.1) -> torch.Tensor:
+    def gaussian_noise(continuous_features: torch.Tensor, probability: float = None, standard_deviation: float = None) -> torch.Tensor:
+        if probability is None:
+            probability = config.augmentation.default_probability
+        if standard_deviation is None:
+            standard_deviation = config.augmentation.default_std_deviation
         if torch.rand(1) > probability:
             return continuous_features
             
@@ -61,7 +69,9 @@ class Augmentation:
         return continuous_features + noise
     
     @staticmethod
-    def time_warp(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = 0.05) -> tuple:
+    def time_warp(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
+        if probability is None:
+            probability = config.augmentation.time_warp_probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
             
@@ -90,7 +100,7 @@ class SequentialDataset(Dataset):
         self.augment = config.model.use_augmentation and augment
         self.augment_probability = config.model.augment_prob
         self.augmenter = Augmentation()
-        self.logger = Logger(name="SequentialDataset", level=logging.INFO)
+        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=None)
 
         self.mask_last_cont = mask_last_cont or []  
         self.last_known_idx = last_known_idx 
@@ -144,7 +154,7 @@ class DatasetLoader:
         data_path,    
     ):
         self.data_path = data_path
-        self.logger = Logger(name="DatasetLoader", level=logging.INFO)
+        self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=None)
 
         self.categorical_columns = config.columns.cat_cols
         self.continuous_columns = config.columns.cont_cols
@@ -168,10 +178,9 @@ class DatasetLoader:
         
         self.logger.subsection("Categorical Encoding")
         dataframe = self._encode_categorical(dataframe)
-       
-        self.logger.subsection("Sampling targets")
-        dataframe, unique_users = self._apply_sampling(dataframe)
-        
+         
+        unique_users = dataframe[config.columns.group_cols[0]].unique()
+
         self.logger.subsection("User Subsampling")
         train_users, validation_users, test_users = self._split_users(unique_users)
         
@@ -209,26 +218,34 @@ class DatasetLoader:
         self.logger.info(f"[Data Loading] Loading sequential data from: {self.data_path}")
         dataframe = pd.read_parquet(self.data_path)
         self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows, {len(dataframe.columns)} columns")
-        dataframe = dataframe.sample(frac=config.data.load_sample_frac, random_state=self.random_state)
-        self.logger.info(f"[Data Loading] Sampled {config.data.load_sample_frac:.1%} of data: {len(dataframe):,} rows\n")
+        
+        group_col = config.columns.group_cols[0]  
+        unique_users = dataframe[group_col].unique()
+        num_users = len(unique_users)
+        
+        if config.data.user_sample_num is not None:
+            sample_size = min(config.data.user_sample_num, num_users)
+        else:
+            sample_size = int(num_users * config.data.load_sample_frac)
+        
+        sampled_users = np.random.choice(unique_users, size=sample_size, replace=False)
+        dataframe = dataframe[dataframe[group_col].isin(sampled_users)]
+        
+        self.logger.info(f"[Data Loading] Sampled {sample_size:,} users (out of {num_users:,}), resulting in {len(dataframe):,} rows\n")
         return dataframe
 
 
     def _clean_data(self, dataframe):
-        payment_date_col = config.columns.payment_date_col
+        payment_date = config.columns.due_date_col
         user_col = config.columns.user_id_col
         
-        if payment_date_col in dataframe.columns:
-            if not pd.api.types.is_datetime64_any_dtype(dataframe[payment_date_col]):
-                dataframe[payment_date_col] = pd.to_datetime(dataframe[payment_date_col], errors='coerce')
-                
-            bad_users = dataframe.loc[dataframe[payment_date_col].isna(), user_col].unique()
-            if len(bad_users) > 0:
-                self.logger.warning(f"[Data Cleaning] Removing {len(bad_users):,} users with missing payment dates (NaT)")
-                dataframe = dataframe[~dataframe[user_col].isin(bad_users)]
-        
+        bad_users = dataframe.loc[dataframe[payment_date].isna(), user_col].unique()
+        if len(bad_users) > 0:
+            self.logger.warning(f"[Data Cleaning] Removing {len(bad_users):,} users with missing payment dates")
+            dataframe = dataframe[~dataframe[user_col].isin(bad_users)]
+    
         self.categorical_columns = [column for column in self.categorical_columns if column in dataframe.columns]
-        self.continuous_columns  = [column for column in self.continuous_columns if column in dataframe.columns]
+        self.continuous_columns  = [column for column in self.continuous_columns  if column in dataframe.columns]
         
         self.logger.subsection("Feature Configuration")
         self.logger.info(f"[Clean] Categorical: {len(self.categorical_columns)} features")
@@ -254,37 +271,6 @@ class DatasetLoader:
         
         self.logger.info(f"[Categorical Encoding] Encoded {len(self.categorical_columns)} categorical features \n")
         return dataframe
-    
-
-    def _apply_sampling(self, dataframe):
-        user_col = config.columns.user_id_col
-        target_col = config.columns.target_cols[0]  
-        unique_users = dataframe[user_col].unique()
-        
-        np.random.seed(config.data.random_state)
-        num_users = len(unique_users)
-        num_sample = int(num_users)
-
-        user_max_target = dataframe.groupby(user_col)[target_col].max()
-        users_gt = user_max_target[user_max_target > 10].index.values
-        users_le = user_max_target[user_max_target <= 10].index.values
-
-        remaining_quota = num_sample - len(users_gt)
-        
-        if len(users_gt) >= num_sample:
-            selected_users = np.random.choice(users_gt, size=num_sample, replace=False)
-        elif remaining_quota > 0:
-            sampled_le = np.random.choice(users_le, size=min(remaining_quota, len(users_le)), replace=False)
-            selected_users = np.concatenate([users_gt, sampled_le])
-        else:
-            selected_users = users_gt
-
-        self.logger.info(f"[Subsampling] All users with target > 10 days: {len(users_gt):,}")
-        self.logger.info(f"[Subsampling] Users randomly selected with target <= 10 days: {len(selected_users) - len(users_gt):,}")
-        self.logger.info(f"[Subsampling] Total selected: {len(selected_users):,}/{num_users:,} users ({len(selected_users)/num_users:.1%}) \n")
-
-        dataframe = dataframe[dataframe[user_col].isin(selected_users)]
-        return dataframe, selected_users
     
 
     def _split_users(self, unique_users):
@@ -331,7 +317,7 @@ class DatasetLoader:
     
 
     def _normalize_continuous_features(self, train_dataframe, validation_dataframe, test_dataframe):
-        no_scale = {'delay_is_known'}
+        no_scale = set(config.columns.no_scale_cols)
         for col in self.continuous_columns:
             if col in no_scale:
                 train_dataframe[col]      = train_dataframe[col].astype(float)
@@ -357,11 +343,18 @@ class DatasetLoader:
         for target_col in self.target_columns:
             self.logger.info(f"[Target Normalization] Target {target_col} mean before normalization: {train_dataframe[target_col].mean():.4f}, std: {train_dataframe[target_col].std():.4f}")
             scaler = StandardScaler()
-            train_targets = np.log1p(np.maximum(train_dataframe[[target_col]].values, 0))
-            scaler.fit(train_targets)
-            train_dataframe[target_col] = scaler.transform(train_targets)
-            validation_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(validation_dataframe[[target_col]].values, 0)))
-            test_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(test_dataframe[[target_col]].values, 0)))
+            if config.data.use_log1p_transform:
+                train_targets = np.log1p(np.maximum(train_dataframe[[target_col]].values, config.data.clip_target_min))
+                scaler.fit(train_targets)
+                train_dataframe[target_col] = scaler.transform(train_targets)
+                validation_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(validation_dataframe[[target_col]].values, config.data.clip_target_min)))
+                test_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(test_dataframe[[target_col]].values, config.data.clip_target_min)))
+            else:
+                train_targets = np.maximum(train_dataframe[[target_col]].values, config.data.clip_target_min)
+                scaler.fit(train_targets)
+                train_dataframe[target_col] = scaler.transform(train_targets)
+                validation_dataframe[target_col] = scaler.transform(np.maximum(validation_dataframe[[target_col]].values, config.data.clip_target_min))
+                test_dataframe[target_col] = scaler.transform(np.maximum(test_dataframe[[target_col]].values, config.data.clip_target_min))
             self.target_scalers[target_col] = scaler
             self.logger.info(f"[Target Normalization] Target {target_col} mean after normalization: {train_dataframe[target_col].mean():.4f}, std: {train_dataframe[target_col].std():.4f}")
 
@@ -383,10 +376,39 @@ class DatasetLoader:
             if num_invoices < config.model.min_seq_len:
                 continue
             
+            group_indices_set = set(group_indices)
+            first_idx = group_indices[0]
+            last_idx = group_indices[-1]
+            expected_contiguous = set(range(first_idx, last_idx + 1))
+            
+            if group_indices_set != expected_contiguous:
+                self.logger.warning(
+                    f"[Index Creation] Group has non-contiguous indices. "
+                    f"First: {first_idx}, Last: {last_idx}, "
+                    f"Missing: {sorted(expected_contiguous - group_indices_set)[:10]}"
+                )
+            
             for invoice_index in range(min_start, num_invoices):
                 target_index = group_indices[invoice_index]
                 sequence_end = target_index + 1
-                sequence_start = max(sequence_end - config.model.max_seq_len, group_indices[0])
+          
+                sequence_start_candidate = sequence_end - config.model.max_seq_len
+                sequence_start = max(sequence_start_candidate, group_indices[0])
+            
+                if sequence_start >= sequence_end:
+                    self.logger.warning(
+                        f"[Index Creation] Invalid sequence bounds: start={sequence_start} >= end={sequence_end}, "
+                        f"target_idx={target_index}, max_seq_len={config.model.max_seq_len}. Skipping."
+                    )
+                    continue
+                
+                if target_index < sequence_start or target_index >= sequence_end:
+                    self.logger.warning(
+                        f"[Index Creation] Target index {target_index} outside sequence bounds "
+                        f"[{sequence_start}, {sequence_end}). This may indicate a problem. Skipping."
+                    )
+                    continue
+                
                 indices.append((sequence_start, sequence_end, target_index))
 
         return indices
@@ -429,7 +451,7 @@ class DatasetLoader:
         return (train_indices, validation_indices, test_indices), (train_dataframe, validation_dataframe, test_dataframe)
 
 
-    def _create_arrays(self, train_dataframe, validation_dataframe, test_dataframe):
+    def _create_arrays(self, train_dataframe, validation_dataframe, test_dataframe):   
         train_continuous       = train_dataframe[self.continuous_columns].values
         validation_continuous  = validation_dataframe[self.continuous_columns].values
         test_continuous        = test_dataframe[self.continuous_columns].values
@@ -467,8 +489,8 @@ class DatasetLoader:
         mask_idxs = []
         known_idx = None
        
-        mask_idxs.append(self.continuous_columns.index('delay_clipped'))
-        known_idx = self.continuous_columns.index('delay_is_known')
+        mask_idxs.append(self.continuous_columns.index(config.columns.delay_clipped_col))
+        known_idx = self.continuous_columns.index(config.columns.delay_is_known_col)
 
         train_indices,     validation_indices,     test_indices     = indices
         train_targets,     validation_targets,     test_targets     = targets
@@ -490,8 +512,8 @@ class DatasetLoader:
     def collate_sequences(batch):
         categorical_list, continuous_list, target_list, lengths = zip(*batch)
         
-        categorical_padded  = pad_sequence(categorical_list, batch_first=True, padding_value=0)
-        continuous_padded   = pad_sequence(continuous_list, batch_first=True, padding_value=0.0)
+        categorical_padded  = pad_sequence(categorical_list, batch_first=True, padding_value=config.model.categorical_padding_value)
+        continuous_padded   = pad_sequence(continuous_list, batch_first=True, padding_value=config.model.continuous_padding_value)
         
         targets = torch.stack(target_list)
         lengths = torch.tensor(lengths, dtype=torch.long)

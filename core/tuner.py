@@ -23,7 +23,7 @@ from logger import Logger
 class OptunaTuner:
     def __init__(self, data_path, project_root, train_loader, val_loader, target_scaler=None, feature_scaler=None):
         
-        self.logger = Logger(name="OptunaTuner", level=logging.INFO)
+        self.logger = Logger(name="OptunaTuner", level=logging.INFO, log_dir=None)
         self.data_path = data_path
         self.study_name = config.optuna.study_name
         self.storage = config.optuna.storage
@@ -35,7 +35,7 @@ class OptunaTuner:
         self.max_epochs = config.optuna.max_epochs
         self.project_root = project_root if project_root else os.path.dirname(current_dir)
         
-        self.sampler = TPESampler(n_startup_trials=config.optuna.n_startup_trials, seed=42)
+        self.sampler = TPESampler(n_startup_trials=config.optuna.n_startup_trials, seed=config.data.random_state)
         self.pruner = MedianPruner(
             n_startup_trials=config.optuna.n_startup_trials,
             n_warmup_steps=config.optuna.pruning_warmup_epochs,
@@ -186,13 +186,13 @@ class OptunaTuner:
         self.best_params = study.best_params
         self.best_value = study.best_value
         
-        results_logger = Logger(log_dir=os.path.join(self.project_root, "runs", "optuna_results"), name="optimization_summary")
+        results_logger = Logger(log_dir=os.path.join(self.project_root, config.paths.runs_dir, config.paths.optuna_results_dir), name="optimization_summary")
         results_logger.info("Optimization completed!")
         results_logger.info(f"\nBest hyperparameters:")
         for key, value in self.best_params.items():
             results_logger.info(f"  {key}: {value}")
 
-        results_dir = os.path.join(self.project_root, "runs", "optuna_results")
+        results_dir = os.path.join(self.project_root, config.paths.runs_dir, config.paths.optuna_results_dir)
         os.makedirs(results_dir, exist_ok=True)
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

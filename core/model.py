@@ -91,7 +91,11 @@ class SwiGLU(nn.Module):
 
 
 class RoPE(nn.Module):
-    def __init__(self, dimension: int, max_sequence_length: int = 512, base: float = 10000.0):
+    def __init__(self, dimension: int, max_sequence_length: int = None, base: float = None):
+        if max_sequence_length is None:
+            max_sequence_length = config.model.max_seq_len
+        if base is None:
+            base = config.model.rope_base
         super().__init__()
         self.dimension = dimension
         self.max_sequence_length = max_sequence_length
@@ -111,8 +115,27 @@ class RoPE(nn.Module):
         return torch.cat([-second_half, first_half], dim=-1)
         
     def forward(self, query: torch.Tensor, key: torch.Tensor, sequence_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos_values = self.cos_cached[:, :, :sequence_length, :].to(query.dtype)
-        sin_values = self.sin_cached[:, :, :sequence_length, :].to(query.dtype)
+        # Clamp sequence_length to avoid index out of bounds
+        actual_length = min(sequence_length, self.max_sequence_length)
+        cos_values = self.cos_cached[:, :, :actual_length, :].to(query.dtype)
+        sin_values = self.sin_cached[:, :, :actual_length, :].to(query.dtype)
+        
+        # If sequence_length > max_sequence_length, compute additional positions dynamically
+        if sequence_length > self.max_sequence_length:
+            # Compute additional positions beyond cache
+            additional_positions = torch.arange(
+                self.max_sequence_length, sequence_length, 
+                device=self.inverse_frequency.device
+            ).type_as(self.inverse_frequency)
+            additional_frequencies = torch.einsum('i,j->ij', additional_positions, self.inverse_frequency)
+            additional_embeddings = torch.cat([additional_frequencies, additional_frequencies], dim=-1)
+            additional_cos = additional_embeddings.cos().unsqueeze(0).unsqueeze(0)
+            additional_sin = additional_embeddings.sin().unsqueeze(0).unsqueeze(0)
+            
+            # Concatenate cached and additional values
+            cos_values = torch.cat([cos_values, additional_cos], dim=2)
+            sin_values = torch.cat([sin_values, additional_sin], dim=2)
+        
         query_embedded = (query * cos_values) + (self._rotate_half(query) * sin_values)
         key_embedded = (key * cos_values) + (self._rotate_half(key) * sin_values)
         return query_embedded, key_embedded
@@ -216,47 +239,58 @@ class TransformerBlock(nn.Module):
         is_causal: bool = False
     ):
         super().__init__()
-        
         self.num_heads = num_heads
         self.head_dimension = model_dimension // num_heads
         self.rotary_positional_embedding = rotary_positional_embedding
         self.is_causal = is_causal
         self.dropout = dropout
-        
-        self.layer_norm_1 = nn.LayerNorm(model_dimension)
-        self.query_key_value = nn.Linear(model_dimension, 3 * model_dimension, bias=False)
-        self.output_projection = nn.Linear(model_dimension, model_dimension)
-        self.drop_path_1 = StochasticDepth(drop_path_rate)
-        
-        self.layer_norm_2 = nn.LayerNorm(model_dimension)
+
+        self.layer_norm_1         = nn.LayerNorm(model_dimension)
+        self.query_key_value      = nn.Linear(model_dimension, 3 * model_dimension, bias=False)
+        self.output_projection    = nn.Linear(model_dimension, model_dimension)
+        self.drop_path_1          = StochasticDepth(drop_path_rate)
+
+        self.layer_norm_2         = nn.LayerNorm(model_dimension)
         self.feed_forward_network = SwiGLU(model_dimension, model_dimension * 4, model_dimension, dropout)
-        self.drop_path_2 = StochasticDepth(drop_path_rate)
-        
-    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, embedding_dimension = input_tensor.shape
-        
+        self.drop_path_2          = StochasticDepth(drop_path_rate)
+
+    def forward(self, input_tensor: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, L, D = input_tensor.shape
         normalized = self.layer_norm_1(input_tensor)
-        
-        query_key_value = self.query_key_value(normalized).reshape(batch_size, sequence_length, 3, self.num_heads, self.head_dimension)
-        query_key_value = query_key_value.permute(2, 0, 3, 1, 4)
-        query, key, value = query_key_value[0], query_key_value[1], query_key_value[2]
-        
+
+        qkv = self.query_key_value(normalized).reshape(B, L, 3, self.num_heads, self.head_dimension)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        query, key, value = qkv[0], qkv[1], qkv[2]  
+
         if self.rotary_positional_embedding is not None:
-            query, key = self.rotary_positional_embedding(query, key, sequence_length)
+            query, key = self.rotary_positional_embedding(query, key, L)
+
+        attn_mask = None
+        if self.is_causal:
+            causal = torch.triu(torch.ones(L, L, device=input_tensor.device, dtype=torch.bool), diagonal=1)  
+            attn_mask = causal[None, None, :, :]  
+
+        if key_padding_mask is not None:
+            pad = key_padding_mask[:, None, None, :]  
+            attn_mask = pad if attn_mask is None else (attn_mask | pad) 
+
+        # Use is_causal=True when only causal mask is needed (more efficient)
+        # Use is_causal=False when we have custom attn_mask (padding + causal)
+        use_causal_flag = self.is_causal and key_padding_mask is None
         
         attention_output = F.scaled_dot_product_attention(
             query, key, value,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=self.is_causal
+            is_causal=use_causal_flag
         )
-        
-        attention_output = attention_output.transpose(1, 2).reshape(batch_size, sequence_length, embedding_dimension)
+
+        attention_output = attention_output.transpose(1, 2).reshape(B, L, D)
         attention_output = self.output_projection(attention_output)
-        
-        input_tensor = input_tensor + self.drop_path_1(attention_output)
-        input_tensor = input_tensor + self.drop_path_2(self.feed_forward_network(self.layer_norm_2(input_tensor)))
-        return input_tensor
+
+        x = input_tensor + self.drop_path_1(attention_output)
+        x = x + self.drop_path_2(self.feed_forward_network(self.layer_norm_2(x)))
+        return x
 
 
 class SequenceEncoder(nn.Module):
@@ -288,22 +322,25 @@ class SequenceEncoder(nn.Module):
         self.layer_norm = nn.LayerNorm(model_dimension)
         
     def forward(self, sequence: torch.Tensor, lengths: Optional[torch.Tensor] = None):
-        
-        batch_size, sequence_length, embedding_dimension = sequence.shape
-        
+        B, L, D = sequence.shape
+
+        key_padding_mask = None
+        if lengths is not None:
+            key_padding_mask = torch.arange(L, device=sequence.device).expand(B, L) >= lengths.unsqueeze(1)
+
         hidden = sequence
         for layer in self.layers:
-            hidden = layer(hidden)
-        
+            hidden = layer(hidden, key_padding_mask=key_padding_mask)
+
         hidden = self.layer_norm(hidden)
-        
+
         if lengths is not None:
-            batch_indices = torch.arange(batch_size, device=sequence.device)
-            last_indices = (lengths - 1).long().clamp(min=0)
-            context = hidden[batch_indices, last_indices]
+            idx = torch.arange(B, device=sequence.device)
+            last = (lengths - 1).long().clamp(min=0, max=L - 1)
+            context = hidden[idx, last]
         else:
             context = hidden[:, -1]
-        
+
         return context, hidden
 
 
@@ -335,7 +372,6 @@ class Model(nn.Module):
         self.hidden_dimension = config.model.hidden_dim
         self.num_categorical = len(embedding_dimensions)
         self.num_continuous = num_continuous
-        self.use_temporal_attention = config.model.use_temporal_attention
         
         self.tokenizer = FeatureTokenizer(
             embedding_dimensions, num_continuous, self.hidden_dimension, 

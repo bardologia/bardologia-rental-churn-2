@@ -4,10 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import copy
 import os
+import math
 from tqdm import tqdm
 
 from core.logger import Logger
@@ -30,7 +31,7 @@ class EMA:
     
     def _get_decay(self) -> float:
         if self.step < self.warmup_steps:
-            return min(self.decay, (1 + self.step) / (10 + self.step))
+            return min(self.decay, (1 + self.step) / (config.model.ema_warmup_denominator + self.step))
         return self.decay
     
     @torch.no_grad()
@@ -67,30 +68,6 @@ class EMA:
         self.decay = state_dict.get('decay', self.decay)
 
 
-class AsymmetricLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.gamma_negative = config.loss.asymmetric_gamma_negative
-        self.gamma_positive = config.loss.asymmetric_gamma_positive
-        self.clip = config.loss.asymmetric_clip
-        
-    def forward(self, logits, targets):
-        probabilities = torch.sigmoid(logits)
-        probabilities_clipped = probabilities.clamp(min=self.clip)
-
-        positive_loss = targets * torch.log(probabilities_clipped.clamp(min=1e-8))
-        if self.gamma_positive > 0:
-            positive_loss = positive_loss * ((1 - probabilities) ** self.gamma_positive)
-        
-        negative_probabilities = (probabilities - self.clip).clamp(min=0)
-        negative_loss = (1 - targets) * torch.log((1 - negative_probabilities).clamp(min=1e-8))
-        if self.gamma_negative > 0:
-            negative_loss = negative_loss * (negative_probabilities ** self.gamma_negative)
-        
-        loss = -(positive_loss + negative_loss)
-        return loss.mean()
-        
-
 class Trainer: 
     def __init__(
         self,
@@ -99,16 +76,21 @@ class Trainer:
         validation_loader,
         checkpoint_dir="checkpoints",
         target_scaler=None,
-        feature_scaler=None
+        feature_scaler=None,
+        log_dir = None
     ):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger = Logger(name="Trainer", level=logging.INFO)
+        if config.model.device is None:
+            config.model.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(config.model.device)
+        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir)
 
         self.logger.section("Trainer Initialization")
         self.logger.info(f"[Device] Using: {self.device}")
         self.logger.info(f"[GPU] Name: {torch.cuda.get_device_name(0)}")
         self.logger.info(f"[GPU] Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         self.logger.info(f"[GPU] CUDA Version: {torch.version.cuda} \n")
+
+        self._log_parameters(model)
 
         self.model = model.to(self.device)
         
@@ -124,37 +106,63 @@ class Trainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=config.model.lr, weight_decay=config.model.weight_decay)
         self.scaler    = GradScaler() if config.model.mixed_precision else None
         
-        self.scheduler = CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=config.model.scheduler_t0,
-            T_mult=config.model.scheduler_t_mult,
-            eta_min=config.model.min_lr
-        )
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode=config.model.scheduler_mode, factor=config.model.scheduler_factor, patience=config.model.scheduler_patience)
+        self.global_step = 0
         
         self.ema = None
         if config.model.use_ema:
             self.ema = EMA(self.model)
+          
+    def _log_parameters(self, model):
+        self.logger.section("[Model Parameter Counts]")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.logger.subsection(f"Full Model - Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        total_params = sum(p.numel() for p in model.tokenizer.parameters())
+        trainable_params = sum(p.numel() for p in model.tokenizer.parameters() if p.requires_grad)
+        self.logger.info(f"[Tokenizer] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        total_params = sum(p.numel() for p in model.invoice_encoder.parameters())
+        trainable_params = sum(p.numel() for p in model.invoice_encoder.parameters() if p.requires_grad)
+        self.logger.info(f"[Invoice Encoder] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        total_params = sum(p.numel() for p in model.sequence_encoder.parameters())
+        trainable_params = sum(p.numel() for p in model.sequence_encoder.parameters() if p.requires_grad)
+        self.logger.info(f"[Sequence Encoder] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        total_params = sum(p.numel() for p in model.temporal_attention.parameters())
+        trainable_params = sum(p.numel() for p in model.temporal_attention.parameters() if p.requires_grad)
+        self.logger.info(f"[Temporal Attention] - Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        total_params = sum(p.numel() for p in model.head_days.parameters())
+        trainable_params = sum(p.numel() for p in model.head_days.parameters() if p.requires_grad)
+        self.logger.info(f"[Prediction Head] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        
+        self.logger.info("")
           
     def save_checkpoint(self, epoch, metric, is_best=False):
         state = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'global_step': self.global_step,
             'best_metric': metric,
             'ema_state_dict': self.ema.state_dict() if self.ema else None,
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
         }
         
-        last_path = os.path.join(self.checkpoint_dir, 'last_checkpoint.pth')
+        last_path = os.path.join(self.checkpoint_dir, config.paths.last_checkpoint_name)
         torch.save(state, last_path)
         
         if is_best:
-            best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
+            best_path = os.path.join(self.checkpoint_dir, config.paths.best_model_name)
             torch.save(state, best_path)
             
             if self.ema:
-                ema_path = os.path.join(self.checkpoint_dir, 'best_model_ema.pth')
+                ema_path = os.path.join(self.checkpoint_dir, config.paths.best_model_ema_name)
                 self.ema.apply_shadow()
                 torch.save(self.model.state_dict(), ema_path)
                 self.ema.restore()
@@ -167,13 +175,15 @@ class Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.model.max_grad_norm)
-            self.scaler.step(self.optimizer)
+            self.scaler.step(self.optimizer)   
             self.scaler.update()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.model.max_grad_norm)
             self.optimizer.step()
-        
+
+        self.global_step += 1
+
         if self.ema:
             self.ema.update()
     
@@ -187,10 +197,12 @@ class Trainer:
             loop = tqdm(range(len(self.train_loader)), desc=f"Train Epoch {epoch} (Overfit Single Batch)")
             for _ in loop:
                 categorical_features, continuous_features, targets, lengths = single_batch
+                
                 categorical_features = categorical_features.to(self.device, non_blocking=True)
                 continuous_features = continuous_features.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 lengths = lengths.to(self.device, non_blocking=True)
+                
                 self.optimizer.zero_grad(set_to_none=True)
                 
                 with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
@@ -199,17 +211,18 @@ class Trainer:
                     loss = self.criterion(preds, target_tensor)
                 
                 self._backward_step(loss)
-                
                 running_loss += loss.detach()
                 num_batches += 1
         else:
             loop = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
             
             for batch_index, (categorical_features, continuous_features, targets, lengths) in enumerate(loop):
+                
                 categorical_features = categorical_features.to(self.device, non_blocking=True)
                 continuous_features = continuous_features.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 lengths = lengths.to(self.device, non_blocking=True)
+                
                 self.optimizer.zero_grad(set_to_none=True)
                 
                 with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
@@ -218,7 +231,6 @@ class Trainer:
                     loss = self.criterion(preds, target_tensor)
                 
                 self._backward_step(loss)
-                
                 running_loss += loss.detach()
                 num_batches += 1
         
@@ -300,9 +312,10 @@ class Trainer:
             train_loss = self.train_epoch(epoch=epoch)
             validation_metrics = self.evaluate(self.validation_loader, use_ema=True)
             validation_rmse = validation_metrics['rmse']
-            self.scheduler.step()
             
-            self.logger.info(f"Epoch {epoch}: Train Loss={train_loss:.4f} | Val Loss={validation_metrics['loss']:.4f} | MAE={validation_metrics['mae']:.4f} | RMSE={validation_rmse:.4f}")
+            self.scheduler.step(validation_rmse)
+            
+            self.logger.info(f"Epoch {epoch}: Train Loss={train_loss:.4f} | Val Loss={validation_metrics['loss']:.4f} | MAE={validation_metrics['mae']:.4f} | RMSE={validation_rmse:.4f} | R2={validation_metrics['r2']:.4f} | StdErr={validation_metrics['std_error']:.4f}")
             if validation_rmse < best_rmse:
                 best_rmse = validation_rmse
                 best_model_state = copy.deepcopy(self.model.state_dict())
