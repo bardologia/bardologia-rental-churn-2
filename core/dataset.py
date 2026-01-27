@@ -152,6 +152,7 @@ class DatasetLoader:
     def __init__(
         self, 
         data_path,    
+        embedding_dimensions=None,
     ):
         self.data_path = data_path
         self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=None)
@@ -161,10 +162,9 @@ class DatasetLoader:
         self.target_columns = config.columns.target_cols
         self.random_state = config.data.random_state
 
-        self.label_encoders = {}
         self.continuous_scalers = {}
-        self.target_scalers = {} 
-        self.embedding_dimensions = []
+        self.target_scalers = {}
+        self.embedding_dimensions = list(embedding_dimensions) if embedding_dimensions is not None else []
 
 
     def dataloader_pipeline(self):
@@ -176,6 +176,9 @@ class DatasetLoader:
         self.logger.subsection("Data Cleaning")
         dataframe = self._clean_data(dataframe)
         
+        self.logger.subsection("Target Clipping")
+        dataframe = self._clip_target(dataframe)
+
         self.logger.subsection("Categorical Encoding")
         dataframe = self._encode_categorical(dataframe)
          
@@ -227,8 +230,9 @@ class DatasetLoader:
             sample_size = min(config.data.user_sample_num, num_users)
         else:
             sample_size = int(num_users * config.data.load_sample_frac)
-        
-        sampled_users = np.random.choice(unique_users, size=sample_size, replace=False)
+
+        rng = np.random.default_rng(config.data.random_state)
+        sampled_users = rng.choice(unique_users, size=sample_size, replace=False)
         dataframe = dataframe[dataframe[group_col].isin(sampled_users)]
         
         self.logger.info(f"[Data Loading] Sampled {sample_size:,} users (out of {num_users:,}), resulting in {len(dataframe):,} rows\n")
@@ -256,19 +260,26 @@ class DatasetLoader:
         return dataframe
 
 
+    def _clip_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        threshold = config.data.target_threshold
+        num_clipped = (dataframe[self.target_columns] > threshold).sum().sum()
+        dataframe[self.target_columns] = dataframe[self.target_columns].clip(upper=threshold)
+        self.logger.info(f"[Clean] Clipped target values to threshold={threshold}: clipped {int(num_clipped):,} values\n")
+        return dataframe
+
+
     def _encode_categorical(self, dataframe):
         for column in self.categorical_columns:
             dataframe[column] = dataframe[column].astype(str)
-        
+
         self.embedding_dimensions = []
-        for column in self.categorical_columns:
+        for column in self.categorical_columns:            
             label_encoder = LabelEncoder()
             dataframe[column] = label_encoder.fit_transform(dataframe[column]) + 1
-            self.label_encoders[column] = label_encoder
             cardinality = len(label_encoder.classes_)
             self.embedding_dimensions.append(cardinality)
-            self.logger.info(f"[Categorical Encoding] Encoded column '{column}' with cardinality {cardinality} \n")
-        
+            self.logger.info(f"[Categorical Encoding] Encoded column '{column}' with cardinality {cardinality}")
+
         self.logger.info(f"[Categorical Encoding] Encoded {len(self.categorical_columns)} categorical features \n")
         return dataframe
     
@@ -313,6 +324,21 @@ class DatasetLoader:
         self.logger.info(f"[Dataframe Split] Validation set: {validation_dataframe.shape}")
         self.logger.info(f"[Dataframe Split] Test set: {test_dataframe.shape} \n")
         
+        train_target_avg = train_dataframe[self.target_columns[0]].mean()
+        train_target_std = train_dataframe[self.target_columns[0]].std()
+        train_target_p90 = train_dataframe[self.target_columns[0]].quantile(0.9)
+        self.logger.info(f"[Dataframe Split] Training target '{self.target_columns[0]}' stats: mean={train_target_avg:.4f}, std={train_target_std:.4f}, 90th percentile={train_target_p90:.4f}")
+
+        validation_target_avg = validation_dataframe[self.target_columns[0]].mean()
+        validation_target_std = validation_dataframe[self.target_columns[0]].std()
+        validation_target_p90 = validation_dataframe[self.target_columns[0]].quantile(0.9)
+        self.logger.info(f"[Dataframe Split] Validation target '{self.target_columns[0]}' stats: mean={validation_target_avg:.4f}, std={validation_target_std:.4f}, 90th percentile={validation_target_p90:.4f}")
+
+        test_target_avg = test_dataframe[self.target_columns[0]].mean()
+        test_target_std = test_dataframe[self.target_columns[0]].std()
+        test_target_p90 = test_dataframe[self.target_columns[0]].quantile(0.9)
+        self.logger.info(f"[Dataframe Split] Test target '{self.target_columns[0]}' stats: mean={test_target_avg:.4f}, std={test_target_std:.4f}, 90th percentile={test_target_p90:.4f} \n")
+
         return train_dataframe, validation_dataframe, test_dataframe
     
 
@@ -325,7 +351,9 @@ class DatasetLoader:
                 test_dataframe[col]       = test_dataframe[col].astype(float)
                 continue
             
-            self.logger.info(f"Feature before normalization - {col}: mean={train_dataframe[col].mean():.4f}, std={train_dataframe[col].std():.4f}")
+            mean_before = train_dataframe[col].mean()
+            std_before  = train_dataframe[col].std()
+        
             scaler = StandardScaler()
             train_values = train_dataframe[[col]].values
             scaler.fit(train_values)
@@ -333,7 +361,7 @@ class DatasetLoader:
             validation_dataframe[col]    = scaler.transform(validation_dataframe[[col]].values)
             test_dataframe[col]          = scaler.transform(test_dataframe[[col]].values)
             self.continuous_scalers[col] = scaler
-            self.logger.info(f"Feature after normalization - {col}: mean={train_dataframe[col].mean():.4f}, std={train_dataframe[col].std():.4f} \n")
+            self.logger.info(f"Feature {col}: mean before={mean_before:.4f}, std before={std_before:.4f}, mean after={train_dataframe[col].mean():.4f}, std after={train_dataframe[col].std():.4f}")
     
         self.logger.info(f"[Continuous Normalization] Normalized {len(self.continuous_columns)} continuous features \n")
         return train_dataframe, validation_dataframe, test_dataframe

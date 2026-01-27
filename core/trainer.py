@@ -77,6 +77,7 @@ class Trainer:
         checkpoint_dir="checkpoints",
         target_scaler=None,
         feature_scaler=None,
+        embedding_dimensions=None,
         log_dir = None
     ):
         if config.model.device is None:
@@ -98,6 +99,7 @@ class Trainer:
         self.validation_loader = validation_loader
         self.target_scaler = target_scaler
         self.feature_scaler = feature_scaler
+        self.embedding_dimensions = embedding_dimensions or []
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -152,6 +154,7 @@ class Trainer:
             'ema_state_dict': self.ema.state_dict() if self.ema else None,
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
+            'embedding_dimensions': list(self.embedding_dimensions) if self.embedding_dimensions is not None else [],
         }
         
         last_path = os.path.join(self.checkpoint_dir, config.paths.last_checkpoint_name)
@@ -285,6 +288,9 @@ class Trainer:
         ss_res = np.sum((den_targets - den_preds) ** 2)
         ss_tot = np.sum((den_targets - np.mean(den_targets)) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float('nan')
+        p50 = np.percentile(np.abs(den_preds - den_targets), 50)
+        p90 = np.percentile(np.abs(den_preds - den_targets), 90)
+        p99 = np.percentile(np.abs(den_preds - den_targets), 99)
 
         std_error = np.std(den_preds - den_targets)
         metrics = {
@@ -292,7 +298,10 @@ class Trainer:
             'mae': mae,
             'rmse': rmse,
             'r2': r2,
-            'std_error': std_error
+            'std_error': std_error,
+            'p50': p50,
+            'p90': p90,
+            'p99': p99,
         }
         
         return metrics

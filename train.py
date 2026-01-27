@@ -70,7 +70,17 @@ def main():
         continuous_scalers  = data_module.continuous_scalers 
 
         model   = Model(embedding_dimensions=data_module.embedding_dimensions, num_continuous=len(data_module.continuous_columns))    
-        trainer = Trainer(model=model, train_loader=train_loader, validation_loader=validation_loader, checkpoint_dir=checkpoint_dir, target_scaler=target_scaler, feature_scaler=continuous_scalers, log_dir=run_dir)
+
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            validation_loader=validation_loader,
+            checkpoint_dir=checkpoint_dir,
+            target_scaler=target_scaler,
+            feature_scaler=continuous_scalers,
+            embedding_dimensions=data_module.embedding_dimensions,
+            log_dir=run_dir
+        )
         
         best_model = trainer.fit()
         

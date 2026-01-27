@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 @dataclass
 class PathsDetails:
@@ -23,12 +23,13 @@ class DataParams:
     sample_frac      : float = 1.0
     
     load_sample_frac : float = 0.01
-    user_sample_num  : int = 100
+    user_sample_num  : int = 200
+    target_threshold : Optional[float] = 90
     
-    rolling_window_sizes: List[int] = field(default_factory=lambda: [3, 5])
-    delay_is_known_value: int = 1
-    use_log1p_transform: bool = True
-    clip_target_min: float = 0.0
+    rolling_window_sizes : List[int] = field(default_factory=lambda: [3, 5])
+    delay_is_known_value : int = 1
+    use_log1p_transform  : bool = True
+    clip_target_min      : float = 0.0
 
 @dataclass
 class TemporalFeatureParams:
@@ -41,9 +42,9 @@ class AugmentationParams:
     temporal_cutout_ratio : float = 0.15
     feature_dropout_ratio : float = 0.2
     gaussian_noise_std    : float = 0.05
-    default_probability: float = 0.1
-    time_warp_probability: float = 0.05
-    default_std_deviation: float = 0.1
+    default_probability   : float = 0.1
+    time_warp_probability : float = 0.05
+    default_std_deviation : float = 0.1
 
 @dataclass
 class Columns:
@@ -116,34 +117,34 @@ class Columns:
 
 @dataclass
 class ModelParams:
-    batch_size: int = 32
+    batch_size: int = 128
     max_seq_len: int = 50
-    min_seq_len: int = 5
+    min_seq_len: int = 10
     
-    epochs: int = 30
+    epochs: int = 2
     lr: float = 3e-4
     dropout: float = 0.05
     weight_decay: float = 1e-4
-    patience: int = 5
+    patience: int = 10
     
     mixed_precision: bool = True
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 3.0
    
-    num_workers: int = 0
-    pin_memory: bool =  False
-    persistent_workers: bool = False
-    prefetch_factor: int = 0
+    num_workers: int = 8
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
     
     hidden_dim: int = 128
     n_heads: int = 4
-    num_invoice_layers: int = 2
-    num_sequence_layers: int = 3
+    num_invoice_layers: int = 1
+    num_sequence_layers: int = 1
 
     scheduler_mode: str = 'min'
-    scheduler_factor: float = 0.1
-    scheduler_patience: int = 10
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 5
     
-    use_ema: bool = True
+    use_ema: bool = False
     ema_decay: float = 0.9999
     ema_warmup_steps: int = 2000
     ema_warmup_denominator: int = 10
