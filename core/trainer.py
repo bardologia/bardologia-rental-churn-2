@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import mean_absolute_percentage_error, median_absolute_error
 import numpy as np
 import copy
 import os
@@ -259,6 +260,63 @@ class Trainer:
         
         return average_loss
     
+    def _metrics(self, den_targets, den_preds, average_loss):
+        mae = np.mean(np.abs(den_preds - den_targets))
+        rmse = np.sqrt(np.mean((den_preds - den_targets) ** 2))
+        ss_res = np.sum((den_targets - den_preds) ** 2)
+        ss_tot = np.sum((den_targets - np.mean(den_targets)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float('nan')
+        p50 = np.percentile(np.abs(den_preds - den_targets), 50)
+        p90 = np.percentile(np.abs(den_preds - den_targets), 90)
+        p99 = np.percentile(np.abs(den_preds - den_targets), 99)
+
+        std_error = np.std(den_preds - den_targets)
+        mape = mean_absolute_percentage_error(den_targets, den_preds)
+        medae = median_absolute_error(den_targets, den_preds)
+        max_error = np.max(np.abs(den_targets - den_preds))
+
+        error_bin_0_5      = np.mean(np.abs(den_targets - den_preds) <= 5) * 100
+        error_bin_5_10     = np.mean((np.abs(den_targets - den_preds) > 5) & (np.abs(den_targets - den_preds) <= 10)) * 100
+        error_bin_10_15    = np.mean((np.abs(den_targets - den_preds) > 10) & (np.abs(den_targets - den_preds) <= 15)) * 100
+        error_bin_15_20    = np.mean((np.abs(den_targets - den_preds) > 15) & (np.abs(den_targets - den_preds) <= 20)) * 100
+        error_bin_20_25    = np.mean((np.abs(den_targets - den_preds) > 20) & (np.abs(den_targets - den_preds) <= 25)) * 100
+        error_bin_above_25 = np.mean(np.abs(den_targets - den_preds) > 25) * 100
+
+        error_target_0_5 = np.mean(np.abs(den_targets - den_preds)[den_targets.flatten() <= 5])
+        error_target_5_10 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 5) & (den_targets.flatten() <= 10)])
+        error_target_10_15 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 10) & (den_targets.flatten() <= 15)])
+        error_target_15_20 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 15) & (den_targets.flatten() <= 20)])
+        error_target_20_25 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 20) & (den_targets.flatten() <= 25)])
+        error_target_above_25 = np.mean(np.abs(den_targets - den_preds)[den_targets.flatten() > 25])
+
+        metrics = {
+            'loss': average_loss,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'std_error': std_error,
+            'p50': p50,
+            'p90': p90,
+            'p99': p99,
+            'mape': mape,
+            'medae': medae,
+            'max_error': max_error,
+            'error_bin_0_5': error_bin_0_5,
+            'error_bin_5_10': error_bin_5_10,
+            'error_bin_10_15': error_bin_10_15,
+            'error_bin_15_20': error_bin_15_20,
+            'error_bin_20_25': error_bin_20_25,
+            'error_bin_above_25': error_bin_above_25,
+            'error_target_0_5': error_target_0_5,
+            'error_target_5_10': error_target_5_10,
+            'error_target_10_15': error_target_10_15,
+            'error_target_15_20': error_target_15_20,
+            'error_target_20_25': error_target_20_25,
+            'error_target_above_25': error_target_above_25
+        }
+
+        return metrics
+
     @torch.no_grad()
     def evaluate(self, loader, use_ema=True):
         self.model.eval()
@@ -298,26 +356,7 @@ class Trainer:
         den_preds   = np.clip(den_preds, 0, None)
         den_targets = np.clip(den_targets, 0, None)
 
-        mae = np.mean(np.abs(den_preds - den_targets))
-        rmse = np.sqrt(np.mean((den_preds - den_targets) ** 2))
-        ss_res = np.sum((den_targets - den_preds) ** 2)
-        ss_tot = np.sum((den_targets - np.mean(den_targets)) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float('nan')
-        p50 = np.percentile(np.abs(den_preds - den_targets), 50)
-        p90 = np.percentile(np.abs(den_preds - den_targets), 90)
-        p99 = np.percentile(np.abs(den_preds - den_targets), 99)
-
-        std_error = np.std(den_preds - den_targets)
-        metrics = {
-            'loss': average_loss,
-            'mae': mae,
-            'rmse': rmse,
-            'r2': r2,
-            'std_error': std_error,
-            'p50': p50,
-            'p90': p90,
-            'p99': p99,
-        }
+        metrics = self._metrics(den_targets, den_preds, average_loss)
         
         return metrics
     
