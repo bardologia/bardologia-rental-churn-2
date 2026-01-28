@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+
 @dataclass
 class PathsDetails:
     raw_data             : str = "data/raw_data.parquet"
@@ -13,6 +14,7 @@ class PathsDetails:
     optuna_tuning_dir    : str = "optuna_tuning"
     optuna_results_dir   : str = "optuna_results"
 
+
 @dataclass
 class DataParams:
     test_size : float = 0.10
@@ -23,19 +25,21 @@ class DataParams:
     sample_frac      : float = 1.0
     
     load_sample_frac : float = 0.01
-    user_sample_num  : int = 200
-    target_threshold : Optional[float] = 90
+    user_sample_num  : int = 3000
+    target_threshold : Optional[float] = 30
     
     rolling_window_sizes : List[int] = field(default_factory=lambda: [3, 5])
     delay_is_known_value : int = 1
     use_log1p_transform  : bool = True
     clip_target_min      : float = 0.0
 
+
 @dataclass
 class TemporalFeatureParams:
     days_in_week      : int = 7
     months_in_year    : int = 12
     weekend_start_day : int = 5
+
 
 @dataclass
 class AugmentationParams:
@@ -46,6 +50,107 @@ class AugmentationParams:
     time_warp_probability : float = 0.05
     default_std_deviation : float = 0.1
 
+
+@dataclass
+class ModelParams:
+    batch_size: int = 128
+    max_seq_len: int = 50
+    min_seq_len: int = 10
+    
+    epochs: int = 20
+    lr: float = 1e-3
+    dropout: float = 0.05
+    weight_decay: float = 1e-4
+    patience: int = 6
+    high_target_weight: float = 0.5
+    
+    mixed_precision: bool = True
+    max_grad_norm: float = 3.0
+   
+    num_workers: int = 8
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
+    
+    hidden_dim: int = 128
+    n_heads: int = 4
+    num_invoice_layers: int = 1
+    num_sequence_layers: int = 1
+
+    scheduler_mode: str = 'min'
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 3
+    
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    ema_warmup_steps: int = 2000
+    ema_warmup_denominator: int = 10
+    
+    drop_path_rate: float = 0.05
+    
+    use_augmentation: bool = False
+    augment_prob: float = 0.1
+    
+    embedding_dropout: float = 0.05
+    periodic_sigma: float = 1.0
+    
+    device: str = None  
+   
+    rope_base: float = 10000.0
+    
+    categorical_padding_value: int = 0
+    continuous_padding_value: float = 0.0
+    
+    overfit_epochs: int = 1000
+    overfit_patience: int = 1000
+    overfit_dropout: float = 0.0
+    overfit_weight_decay: float = 0.0
+    overfit_num_users: int = 3
+    overfit_min_lenghth: int = 2
+    overfit_test_size: float = 0.3
+    overfit_val_size: float = 0.3
+    overfit_use_ema: bool = False
+    overfit_use_augmentation: bool = False
+    overfit_mixed_precision: bool = False
+
+
+    overfit_single_batch: bool = False
+
+
+@dataclass
+class OptunaParams:
+    study_name: str = "payment_default_study"
+    storage: str = None
+    n_trials: int = 100
+    n_startup_trials: int = 5
+    timeout: float = None
+    pruning_warmup_epochs: int = 2
+    early_stopping_patience: int = 8
+    max_epochs: int = 25
+    
+    learning_rate_min: float = 1e-4
+    learning_rate_max: float = 5e-3
+    
+    hidden_dim_options: List[int] = field(default_factory=lambda: [64, 96, 128, 160, 192])
+    
+    num_invoice_layers_min: int = 1
+    num_invoice_layers_max: int = 3
+    
+    num_sequence_layers_min: int = 2
+    num_sequence_layers_max: int = 5
+    
+    num_heads_options: List[int] = field(default_factory=lambda: [4, 8])
+    
+    dropout_min: float = 0.05
+    dropout_max: float = 0.3
+
+    weight_decay_min: float = 1e-5
+    weight_decay_max: float = 1e-3
+    
+    periodic_sigma_min: float = 0.5
+    periodic_sigma_max: float = 2.0
+ 
+  
 @dataclass
 class Columns:
     
@@ -115,104 +220,6 @@ class Columns:
 
     no_scale_cols: List[str] = field(default_factory=lambda: ['delay_is_known'])
 
-@dataclass
-class ModelParams:
-    batch_size: int = 128
-    max_seq_len: int = 50
-    min_seq_len: int = 10
-    
-    epochs: int = 2
-    lr: float = 3e-4
-    dropout: float = 0.05
-    weight_decay: float = 1e-4
-    patience: int = 10
-    
-    mixed_precision: bool = True
-    max_grad_norm: float = 3.0
-   
-    num_workers: int = 8
-    pin_memory: bool = True
-    persistent_workers: bool = True
-    prefetch_factor: int = 4
-    
-    hidden_dim: int = 128
-    n_heads: int = 4
-    num_invoice_layers: int = 1
-    num_sequence_layers: int = 1
-
-    scheduler_mode: str = 'min'
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 5
-    
-    use_ema: bool = False
-    ema_decay: float = 0.9999
-    ema_warmup_steps: int = 2000
-    ema_warmup_denominator: int = 10
-    
-    drop_path_rate: float = 0.05
-    
-    use_augmentation: bool = False
-    augment_prob: float = 0.1
-    
-    embedding_dropout: float = 0.05
-    periodic_sigma: float = 1.0
-    
-    device: str = None  
-   
-    rope_base: float = 10000.0
-    
-    categorical_padding_value: int = 0
-    continuous_padding_value: float = 0.0
-    
-    overfit_epochs: int = 1000
-    overfit_patience: int = 1000
-    overfit_dropout: float = 0.0
-    overfit_weight_decay: float = 0.0
-    overfit_num_users: int = 3
-    overfit_min_lenghth: int = 2
-    overfit_test_size: float = 0.3
-    overfit_val_size: float = 0.3
-    overfit_use_ema: bool = False
-    overfit_use_augmentation: bool = False
-    overfit_mixed_precision: bool = False
-
-
-    overfit_single_batch: bool = False
-
-@dataclass
-class OptunaParams:
-    study_name: str = "payment_default_study"
-    storage: str = None
-    n_trials: int = 100
-    n_startup_trials: int = 5
-    timeout: float = None
-    pruning_warmup_epochs: int = 2
-    early_stopping_patience: int = 8
-    max_epochs: int = 25
-    
-    learning_rate_min: float = 1e-4
-    learning_rate_max: float = 5e-3
-    
-    hidden_dim_options: List[int] = field(default_factory=lambda: [64, 96, 128, 160, 192])
-    
-    num_invoice_layers_min: int = 1
-    num_invoice_layers_max: int = 3
-    
-    num_sequence_layers_min: int = 2
-    num_sequence_layers_max: int = 5
-    
-    num_heads_options: List[int] = field(default_factory=lambda: [4, 8])
-    
-    dropout_min: float = 0.05
-    dropout_max: float = 0.3
-
-    weight_decay_min: float = 1e-5
-    weight_decay_max: float = 1e-3
-    
-    periodic_sigma_min: float = 0.5
-    periodic_sigma_max: float = 2.0
- 
-  
 
 @dataclass
 class Config:

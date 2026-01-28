@@ -100,11 +100,13 @@ class Trainer:
         self.target_scaler = target_scaler
         self.feature_scaler = feature_scaler
         self.embedding_dimensions = embedding_dimensions or []
+        self.high_target_weight = config.model.high_target_weight
+        self.logger.info(f"[High Target Weight] Using high target weight: {self.high_target_weight}\n")
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         
-        self.criterion = nn.SmoothL1Loss() 
+        self.criterion = nn.SmoothL1Loss(reduction='none') 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=config.model.lr, weight_decay=config.model.weight_decay)
         self.scaler    = GradScaler() if config.model.mixed_precision else None
         
@@ -142,6 +144,19 @@ class Trainer:
         self.logger.info(f"[Prediction Head] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
         
         self.logger.info("")
+
+    def _weighted_loss(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        losses = self.criterion(preds, targets).view(-1)
+
+        if self.high_target_weight and self.target_scaler is not None and self.high_target_weight > 0:
+            den_targets = np.expm1(self.target_scaler.inverse_transform(targets.detach().cpu().numpy().reshape(-1, 1))).reshape(-1)
+            den_targets = torch.from_numpy(den_targets).to(self.device).float()
+            mean_den = den_targets.mean().clamp_min(1e-8)
+            weights = 1.0 + self.high_target_weight * (den_targets / mean_den)
+            weighted = losses * weights
+            return weighted.mean()
+
+        return losses.mean()
           
     def save_checkpoint(self, epoch, metric, is_best=False):
         state = {
@@ -211,7 +226,7 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
                     preds = self.model(categorical_features, continuous_features, lengths)
                     target_tensor = targets.view(-1)
-                    loss = self.criterion(preds, target_tensor)
+                    loss = self._weighted_loss(preds, target_tensor)
                 
                 self._backward_step(loss)
                 running_loss += loss.detach()
@@ -231,7 +246,7 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
                     preds = self.model(categorical_features, continuous_features, lengths)
                     target_tensor = targets.view(-1)
-                    loss = self.criterion(preds, target_tensor)
+                    loss = self._weighted_loss(preds, target_tensor)
                 
                 self._backward_step(loss)
                 running_loss += loss.detach()
@@ -262,7 +277,7 @@ class Trainer:
             
             preds = self.model(categorical_features, continuous_features, lengths)
             target_tensor = targets.view(-1)
-            loss = self.criterion(preds, target_tensor)
+            loss = self.criterion(preds, target_tensor).mean()
             running_loss += loss.detach()
             
             num_batches += 1

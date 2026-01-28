@@ -278,7 +278,9 @@ class DatasetLoader:
             dataframe[column] = label_encoder.fit_transform(dataframe[column]) + 1
             cardinality = len(label_encoder.classes_)
             self.embedding_dimensions.append(cardinality)
-            self.logger.info(f"[Categorical Encoding] Encoded column '{column}' with cardinality {cardinality}")
+            self.logger.info(
+                f"[Categorical Encoding] Column {column:<25} | cardinality={cardinality:6d}"
+            )
 
         self.logger.info(f"[Categorical Encoding] Encoded {len(self.categorical_columns)} categorical features \n")
         return dataframe
@@ -361,7 +363,9 @@ class DatasetLoader:
             validation_dataframe[col]    = scaler.transform(validation_dataframe[[col]].values)
             test_dataframe[col]          = scaler.transform(test_dataframe[[col]].values)
             self.continuous_scalers[col] = scaler
-            self.logger.info(f"Feature {col}: mean before={mean_before:.4f}, std before={std_before:.4f}, mean after={train_dataframe[col].mean():.4f}, std after={train_dataframe[col].std():.4f}")
+            self.logger.info(
+                f"Feature {col:<25} | mean before={mean_before:10.4f} | std before={std_before:10.4f} | mean after={train_dataframe[col].mean():10.4f} | std after={train_dataframe[col].std():10.4f}"
+            )
     
         self.logger.info(f"[Continuous Normalization] Normalized {len(self.continuous_columns)} continuous features \n")
         return train_dataframe, validation_dataframe, test_dataframe
@@ -369,7 +373,8 @@ class DatasetLoader:
 
     def _normalize_targets(self, train_dataframe, validation_dataframe, test_dataframe):
         for target_col in self.target_columns:
-            self.logger.info(f"[Target Normalization] Target {target_col} mean before normalization: {train_dataframe[target_col].mean():.4f}, std: {train_dataframe[target_col].std():.4f}")
+            mean_before = train_dataframe[target_col].mean()
+            std_before = train_dataframe[target_col].std()
             scaler = StandardScaler()
             if config.data.use_log1p_transform:
                 train_targets = np.log1p(np.maximum(train_dataframe[[target_col]].values, config.data.clip_target_min))
@@ -384,7 +389,11 @@ class DatasetLoader:
                 validation_dataframe[target_col] = scaler.transform(np.maximum(validation_dataframe[[target_col]].values, config.data.clip_target_min))
                 test_dataframe[target_col] = scaler.transform(np.maximum(test_dataframe[[target_col]].values, config.data.clip_target_min))
             self.target_scalers[target_col] = scaler
-            self.logger.info(f"[Target Normalization] Target {target_col} mean after normalization: {train_dataframe[target_col].mean():.4f}, std: {train_dataframe[target_col].std():.4f}")
+            mean_after = train_dataframe[target_col].mean()
+            std_after = train_dataframe[target_col].std()
+            self.logger.info(
+                f"[Target Normalization] Target {target_col:<30} | mean before={mean_before:8.4f} | std before={std_before:8.4f} | mean after={mean_after:8.4f} | std after={std_after:8.4f}"
+            )
 
         self.logger.info(f"[Target Normalization] Normalized {len(self.target_columns)} target features \n")
         return train_dataframe, validation_dataframe, test_dataframe
