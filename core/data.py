@@ -61,9 +61,9 @@ class FeatureEngineer:
     
     def create_temporal_features(self, dataframe: pd.DataFrame) -> pd.DataFrame: 
         due_date_col = config.columns.due_date_col
-        weekend_start_day = config.temporal.weekend_start_day
-        days_in_week = config.temporal.days_in_week
-        months_in_year = config.temporal.months_in_year
+        weekend_start_day = config.temporal_features.weekend_start_day
+        days_in_week = config.temporal_features.days_in_week
+        months_in_year = config.temporal_features.months_in_year
         
         d = dataframe[due_date_col]
         days_in_month = d.dt.daysinmonth
@@ -127,7 +127,7 @@ class FeatureEngineer:
             
         dataframe['days_since_last_invoice'] = dataframe.groupby(user_col)[due_date_col].diff().dt.days.fillna(0)
     
-        for window_size in config.data.rolling_window_sizes:
+        for window_size in config.sequence_features.rolling_window_sizes:
             dataframe[f'rolling_mean_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).mean().shift(1)).fillna(0).clip(lower=0)
             dataframe[f'rolling_max_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).max().shift(1)).fillna(0).clip(lower=0)
 
@@ -170,7 +170,7 @@ class FeatureEngineer:
         delay_col = config.columns.delay_col
         target_col = config.columns.target_col_name
         dataframe[config.columns.delay_clipped_col] = dataframe[delay_col].clip(lower=0)
-        dataframe[config.columns.delay_is_known_col] = config.data.delay_is_known_value
+        dataframe[config.columns.delay_is_known_col] = config.target.delay_is_known_value
         dataframe[config.columns.target_col_name] = dataframe[config.columns.delay_clipped_col]
         self.logger.info(f"[Target Creation] Created target column: {target_col} from {delay_col} \n")
         return dataframe
@@ -203,8 +203,8 @@ class DataPipeline:
     
     def _load_data(self, input_path: str) -> pd.DataFrame:
         dataframe = pd.read_parquet(input_path)
-        dataframe = dataframe.sample(frac=config.data.sample_frac, random_state=config.data.random_state)
-        self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows from {input_path.split('/')[-1]} (sample_frac={config.data.sample_frac}) \n")
+        dataframe = dataframe.sample(frac=config.data_sampling.sample_frac, random_state=config.data_split.random_state)
+        self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows from {input_path.split('/')[-1]} (sample_frac={config.data_sampling.sample_frac}) \n")
         return dataframe
     
     def _finalize_data(self, dataframe: pd.DataFrame) -> pd.DataFrame:

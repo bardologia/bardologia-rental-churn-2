@@ -42,23 +42,23 @@ def main():
         pipeline.run(raw_path, data_path)
         print(f"Generated new training data: {data_path}")
     
-    logger = Logger(name="train", level="INFO", log_dir=run_dir)
+    logger = Logger(name="train", level="INFO", log_dir=run_dir, enable_tensorboard=False)
     trainer = None
 
-    if config.model.overfit_single_batch:
-        config.model.dropout  = config.model.overfit_dropout
-        config.model.embedding_dropout = config.model.overfit_dropout
-        config.model.use_augmentation = config.model.overfit_use_augmentation
-        config.model.weight_decay = config.model.overfit_weight_decay
-        config.model.patience = config.model.overfit_patience
-        config.model.epochs = config.model.overfit_epochs
-        config.model.scheduler_patience = config.model.overfit_patience
-        config.model.mixed_precision = config.model.overfit_mixed_precision
-        config.model.use_ema = config.model.overfit_use_ema
-        config.data.val_size = config.model.overfit_val_size
-        config.data.test_size = config.model.overfit_test_size
-        config.data.user_sample_num = config.model.overfit_num_users
-        config.model.min_seq_len = config.model.overfit_min_lenghth
+    if config.overfit.enabled:
+        config.architecture.dropout  = config.overfit.dropout
+        config.architecture.embedding_dropout = config.overfit.dropout
+        config.augmentation.enabled = config.overfit.use_augmentation
+        config.training.weight_decay = config.overfit.weight_decay
+        config.training.patience = config.overfit.patience
+        config.training.epochs = config.overfit.epochs
+        config.scheduler.patience = config.overfit.patience
+        config.training.mixed_precision = config.overfit.mixed_precision
+        config.ema.enabled = config.overfit.use_ema
+        config.data_split.val_size = config.overfit.val_size
+        config.data_split.test_size = config.overfit.test_size
+        config.data_sampling.user_sample_num = config.overfit.num_users
+        config.sequence.min_seq_len = config.overfit.min_seq_len
         logger.warning("Overfit single batch mode: Disabled dropout, augmentation, weight decay, mixed precision, and increased epochs and patience.")
 
     try:

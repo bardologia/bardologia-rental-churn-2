@@ -93,9 +93,9 @@ class SwiGLU(nn.Module):
 class RoPE(nn.Module):
     def __init__(self, dimension: int, max_sequence_length: int = None, base: float = None):
         if max_sequence_length is None:
-            max_sequence_length = config.model.max_seq_len
+            max_sequence_length = config.sequence.max_seq_len
         if base is None:
-            base = config.model.rope_base
+            base = config.architecture.rope_base
         super().__init__()
         self.dimension = dimension
         self.max_sequence_length = max_sequence_length
@@ -115,14 +115,11 @@ class RoPE(nn.Module):
         return torch.cat([-second_half, first_half], dim=-1)
         
     def forward(self, query: torch.Tensor, key: torch.Tensor, sequence_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Clamp sequence_length to avoid index out of bounds
         actual_length = min(sequence_length, self.max_sequence_length)
         cos_values = self.cos_cached[:, :, :actual_length, :].to(query.dtype)
         sin_values = self.sin_cached[:, :, :actual_length, :].to(query.dtype)
         
-        # If sequence_length > max_sequence_length, compute additional positions dynamically
         if sequence_length > self.max_sequence_length:
-            # Compute additional positions beyond cache
             additional_positions = torch.arange(
                 self.max_sequence_length, sequence_length, 
                 device=self.inverse_frequency.device
@@ -132,7 +129,6 @@ class RoPE(nn.Module):
             additional_cos = additional_embeddings.cos().unsqueeze(0).unsqueeze(0)
             additional_sin = additional_embeddings.sin().unsqueeze(0).unsqueeze(0)
             
-            # Concatenate cached and additional values
             cos_values = torch.cat([cos_values, additional_cos], dim=2)
             sin_values = torch.cat([sin_values, additional_sin], dim=2)
         
@@ -163,10 +159,10 @@ class FeatureTokenizer(nn.Module):
     ):
         super().__init__()
         
-        sigma = config.model.periodic_sigma
+        sigma = config.architecture.periodic_sigma
         
         self.categorical_embeddings = nn.ModuleList([nn.Embedding(cardinality + 1, token_dimension, padding_idx=0) for cardinality in cardinalities])
-        self.embedding_dropout = nn.Dropout(config.model.embedding_dropout)
+        self.embedding_dropout = nn.Dropout(config.architecture.embedding_dropout)
         self.token_dimension = token_dimension
       
         self.continuous_embedding = FourierFeatures(num_continuous, token_dimension, sigma=sigma)
@@ -258,7 +254,7 @@ class TransformerBlock(nn.Module):
         B, L, D = input_tensor.shape
         normalized = self.layer_norm_1(input_tensor)
 
-        qkv = self.query_key_value(normalized).reshape(B, L, 3, self.num_heads, self.head_dimension)
+        qkv = self.query_key_value(normalized).view(B, L, 3, self.num_heads, self.head_dimension)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         query, key, value = qkv[0], qkv[1], qkv[2]  
 
@@ -274,8 +270,6 @@ class TransformerBlock(nn.Module):
             pad = key_padding_mask[:, None, None, :]  
             attn_mask = pad if attn_mask is None else (attn_mask | pad) 
 
-        # Use is_causal=True when only causal mask is needed (more efficient)
-        # Use is_causal=False when we have custom attn_mask (padding + causal)
         use_causal_flag = self.is_causal and key_padding_mask is None
         
         attention_output = F.scaled_dot_product_attention(
@@ -285,7 +279,7 @@ class TransformerBlock(nn.Module):
             is_causal=use_causal_flag
         )
 
-        attention_output = attention_output.transpose(1, 2).reshape(B, L, D)
+        attention_output = attention_output.transpose(1, 2).view(B, L, D)
         attention_output = self.output_projection(attention_output)
 
         x = input_tensor + self.drop_path_1(attention_output)
@@ -369,7 +363,7 @@ class Model(nn.Module):
     ):
         super().__init__()
         
-        self.hidden_dimension = config.model.hidden_dim
+        self.hidden_dimension = config.architecture.hidden_dim
         self.num_categorical = len(embedding_dimensions)
         self.num_continuous = num_continuous
         
@@ -379,25 +373,25 @@ class Model(nn.Module):
         
         self.invoice_encoder = InvoiceEncoder(
             self.hidden_dimension, 
-            num_heads=config.model.n_heads,
-            num_layers=config.model.num_invoice_layers, 
-            dropout=config.model.dropout,
-            drop_path_rate=config.model.drop_path_rate
+            num_heads=config.architecture.n_heads,
+            num_layers=config.architecture.num_invoice_layers, 
+            dropout=config.architecture.dropout,
+            drop_path_rate=config.architecture.drop_path_rate
         )
         
         self.sequence_encoder = SequenceEncoder(
             self.hidden_dimension,
-            num_heads=config.model.n_heads,
-            num_layers=config.model.num_sequence_layers,
-            dropout=config.model.dropout,
-            drop_path_rate=config.model.drop_path_rate,
-            max_sequence_length=config.model.max_seq_len
+            num_heads=config.architecture.n_heads,
+            num_layers=config.architecture.num_sequence_layers,
+            dropout=config.architecture.dropout,
+            drop_path_rate=config.architecture.drop_path_rate,
+            max_sequence_length=config.sequence.max_seq_len
         )
         
-        self.temporal_attention = CrossAttention(self.hidden_dimension, num_heads=config.model.n_heads, dropout=config.model.dropout)
+        self.temporal_attention = CrossAttention(self.hidden_dimension, num_heads=config.architecture.n_heads, dropout=config.architecture.dropout)
         
         head_input_dimension = self.hidden_dimension * 3
-        self.head_days = PredictionHead(head_input_dimension, self.hidden_dimension, dropout=config.model.dropout, num_outputs=1)
+        self.head_days = PredictionHead(head_input_dimension, self.hidden_dimension, dropout=config.architecture.dropout, num_outputs=1)
         
     def forward(
         self, 

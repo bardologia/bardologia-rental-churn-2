@@ -15,7 +15,7 @@ class Augmentation:
     @staticmethod
     def temporal_cutout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
         if probability is None:
-            probability = config.augmentation.default_probability
+            probability = config.augmentation.probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
             
@@ -37,7 +37,7 @@ class Augmentation:
     @staticmethod
     def feature_dropout(categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
         if probability is None:
-            probability = config.augmentation.default_probability
+            probability = config.augmentation.probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
         
@@ -59,9 +59,9 @@ class Augmentation:
     @staticmethod
     def gaussian_noise(continuous_features: torch.Tensor, probability: float = None, standard_deviation: float = None) -> torch.Tensor:
         if probability is None:
-            probability = config.augmentation.default_probability
+            probability = config.augmentation.probability
         if standard_deviation is None:
-            standard_deviation = config.augmentation.default_std_deviation
+            standard_deviation = config.augmentation.gaussian_noise_std
         if torch.rand(1) > probability:
             return continuous_features
             
@@ -97,8 +97,8 @@ class SequentialDataset(Dataset):
         self.continuous_data = torch.as_tensor(continuous_data, dtype=torch.float32)
         self.targets = torch.as_tensor(targets, dtype=torch.float32)
         self.indices = indices
-        self.augment = config.model.use_augmentation and augment
-        self.augment_probability = config.model.augment_prob
+        self.augment = config.augmentation.enabled and augment
+        self.augment_probability = config.augmentation.probability
         self.augmenter = Augmentation()
         self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=None)
 
@@ -137,7 +137,8 @@ class SequentialDataset(Dataset):
         if self.augment and self.training_mode:
             categorical_features, continuous_features = self.augmenter.feature_dropout(categorical_features, continuous_features, probability=self.augment_probability)
             continuous_features = self.augmenter.gaussian_noise(continuous_features, probability=self.augment_probability, standard_deviation=config.augmentation.gaussian_noise_std)
-        
+            categorical_features, continuous_features = self.augmenter.time_warp(categorical_features, continuous_features, probability=self.augment_probability)
+
         self.mask_target(continuous_features)
 
         length = categorical_features.shape[0]
@@ -160,7 +161,7 @@ class DatasetLoader:
         self.categorical_columns = config.columns.cat_cols
         self.continuous_columns = config.columns.cont_cols
         self.target_columns = config.columns.target_cols
-        self.random_state = config.data.random_state
+        self.random_state = config.data_split.random_state
 
         self.continuous_scalers = {}
         self.target_scalers = {}
@@ -226,12 +227,12 @@ class DatasetLoader:
         unique_users = dataframe[group_col].unique()
         num_users = len(unique_users)
         
-        if config.data.user_sample_num is not None:
-            sample_size = min(config.data.user_sample_num, num_users)
+        if config.data_sampling.user_sample_num is not None:
+            sample_size = min(config.data_sampling.user_sample_num, num_users)
         else:
-            sample_size = int(num_users * config.data.load_sample_frac)
+            sample_size = int(num_users * config.data_sampling.load_sample_frac)
 
-        rng = np.random.default_rng(config.data.random_state)
+        rng = np.random.default_rng(config.data_split.random_state)
         sampled_users = rng.choice(unique_users, size=sample_size, replace=False)
         dataframe = dataframe[dataframe[group_col].isin(sampled_users)]
         
@@ -261,7 +262,7 @@ class DatasetLoader:
 
 
     def _clip_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        threshold = config.data.target_threshold
+        threshold = config.target.target_threshold
         num_clipped = (dataframe[self.target_columns] > threshold).sum().sum()
         dataframe[self.target_columns] = dataframe[self.target_columns].clip(upper=threshold)
         self.logger.info(f"[Clean] Clipped target values to threshold={threshold}: clipped {int(num_clipped):,} values\n")
@@ -290,17 +291,17 @@ class DatasetLoader:
         user_col       = config.columns.user_id_col
         user_dataframe = pd.DataFrame({user_col: unique_users})
         
-        test_size       = config.data.test_size
-        validation_size = config.data.val_size
+        test_size       = config.data_split.test_size
+        validation_size = config.data_split.val_size
         
-        group_shuffle_split_test = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state = config.data.random_state)
+        group_shuffle_split_test = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=config.data_split.random_state)
         train_validation_indices, test_indices = next(group_shuffle_split_test.split(user_dataframe, groups=user_dataframe[user_col]))
         
         train_validation_users = user_dataframe.iloc[train_validation_indices][user_col].values
         test_users = user_dataframe.iloc[test_indices][user_col].values
         
         validation_size_adjusted = validation_size / (1 - test_size)
-        group_shuffle_split_validation = GroupShuffleSplit(n_splits=1, test_size=validation_size_adjusted, random_state = config.data.random_state)
+        group_shuffle_split_validation = GroupShuffleSplit(n_splits=1, test_size=validation_size_adjusted, random_state=config.data_split.random_state)
         train_indices, validation_indices = next(group_shuffle_split_validation.split(pd.DataFrame({user_col: train_validation_users}), groups=train_validation_users))
         
         train_users      = set(train_validation_users[train_indices])
@@ -376,18 +377,18 @@ class DatasetLoader:
             mean_before = train_dataframe[target_col].mean()
             std_before = train_dataframe[target_col].std()
             scaler = StandardScaler()
-            if config.data.use_log1p_transform:
-                train_targets = np.log1p(np.maximum(train_dataframe[[target_col]].values, config.data.clip_target_min))
+            if config.target.use_log1p_transform:
+                train_targets = np.log1p(np.maximum(train_dataframe[[target_col]].values, config.target.clip_target_min))
                 scaler.fit(train_targets)
                 train_dataframe[target_col] = scaler.transform(train_targets)
-                validation_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(validation_dataframe[[target_col]].values, config.data.clip_target_min)))
-                test_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(test_dataframe[[target_col]].values, config.data.clip_target_min)))
+                validation_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(validation_dataframe[[target_col]].values, config.target.clip_target_min)))
+                test_dataframe[target_col] = scaler.transform(np.log1p(np.maximum(test_dataframe[[target_col]].values, config.target.clip_target_min)))
             else:
-                train_targets = np.maximum(train_dataframe[[target_col]].values, config.data.clip_target_min)
+                train_targets = np.maximum(train_dataframe[[target_col]].values, config.target.clip_target_min)
                 scaler.fit(train_targets)
                 train_dataframe[target_col] = scaler.transform(train_targets)
-                validation_dataframe[target_col] = scaler.transform(np.maximum(validation_dataframe[[target_col]].values, config.data.clip_target_min))
-                test_dataframe[target_col] = scaler.transform(np.maximum(test_dataframe[[target_col]].values, config.data.clip_target_min))
+                validation_dataframe[target_col] = scaler.transform(np.maximum(validation_dataframe[[target_col]].values, config.target.clip_target_min))
+                test_dataframe[target_col] = scaler.transform(np.maximum(test_dataframe[[target_col]].values, config.target.clip_target_min))
             self.target_scalers[target_col] = scaler
             mean_after = train_dataframe[target_col].mean()
             std_after = train_dataframe[target_col].std()
@@ -404,13 +405,13 @@ class DatasetLoader:
         dataframe_reset = dataframe.reset_index(drop=True)
         group_offsets = dataframe_reset.groupby(group_column).indices
 
-        min_start = config.model.min_seq_len - 1
+        min_start = config.sequence.min_seq_len - 1
 
         for _, group_indices in group_offsets.items():
             group_indices = np.sort(group_indices)
             num_invoices = len(group_indices)
 
-            if num_invoices < config.model.min_seq_len:
+            if num_invoices < config.sequence.min_seq_len:
                 continue
             
             group_indices_set = set(group_indices)
@@ -429,13 +430,13 @@ class DatasetLoader:
                 target_index = group_indices[invoice_index]
                 sequence_end = target_index + 1
           
-                sequence_start_candidate = sequence_end - config.model.max_seq_len
+                sequence_start_candidate = sequence_end - config.sequence.max_seq_len
                 sequence_start = max(sequence_start_candidate, group_indices[0])
             
                 if sequence_start >= sequence_end:
                     self.logger.warning(
                         f"[Index Creation] Invalid sequence bounds: start={sequence_start} >= end={sequence_end}, "
-                        f"target_idx={target_index}, max_seq_len={config.model.max_seq_len}. Skipping."
+                        f"target_idx={target_index}, max_seq_len={config.sequence.max_seq_len}. Skipping."
                     )
                     continue
                 
@@ -549,8 +550,8 @@ class DatasetLoader:
     def collate_sequences(batch):
         categorical_list, continuous_list, target_list, lengths = zip(*batch)
         
-        categorical_padded  = pad_sequence(categorical_list, batch_first=True, padding_value=config.model.categorical_padding_value)
-        continuous_padded   = pad_sequence(continuous_list, batch_first=True, padding_value=config.model.continuous_padding_value)
+        categorical_padded  = pad_sequence(categorical_list, batch_first=True, padding_value=config.sequence.categorical_padding_value)
+        continuous_padded   = pad_sequence(continuous_list, batch_first=True, padding_value=config.sequence.continuous_padding_value)
         
         targets = torch.stack(target_list)
         lengths = torch.tensor(lengths, dtype=torch.long)
@@ -562,31 +563,31 @@ class DatasetLoader:
 
         train_dataloader = DataLoader(
             train_dataset,
-            batch_size=config.model.batch_size,
+            batch_size=config.training.batch_size,
             shuffle=True,
-            num_workers=config.model.num_workers,
-            pin_memory=config.model.pin_memory,
-            persistent_workers=config.model.num_workers > 0,
+            num_workers=config.dataloader.num_workers,
+            pin_memory=config.dataloader.pin_memory,
+            persistent_workers=config.dataloader.num_workers > 0,
             collate_fn=self.collate_sequences
         )
 
         validation_dataloader = DataLoader(
             validation_dataset,
-            batch_size=config.model.batch_size,
+            batch_size=config.training.batch_size,
             shuffle=False,
-            num_workers=config.model.num_workers,
-            pin_memory=config.model.pin_memory,
-            persistent_workers=config.model.num_workers > 0,
+            num_workers=config.dataloader.num_workers,
+            pin_memory=config.dataloader.pin_memory,
+            persistent_workers=config.dataloader.num_workers > 0,
             collate_fn=self.collate_sequences
         )
 
         test_dataloader = DataLoader(
             test_dataset,
-            batch_size=config.model.batch_size,
+            batch_size=config.training.batch_size,
             shuffle=False,
-            num_workers=config.model.num_workers,
-            pin_memory=config.model.pin_memory,
-            persistent_workers=config.model.num_workers > 0,
+            num_workers=config.dataloader.num_workers,
+            pin_memory=config.dataloader.pin_memory,
+            persistent_workers=config.dataloader.num_workers > 0,
             collate_fn=self.collate_sequences
         )
 
