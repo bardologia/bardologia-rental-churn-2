@@ -15,13 +15,14 @@ class Logger:
         'CRITICAL': logging.CRITICAL
     }
     
-    def __init__(self, log_dir="logs", name="experiment", level="INFO", enable_tensorboard=True):
+    def __init__(self, log_dir="logs", name="experiment", level="INFO", enable_tensorboard=False, active = True):
         self.log_dir = log_dir
         self.name = name
         self.start_time = datetime.now()
         if log_dir:
             os.makedirs(self.log_dir, exist_ok=True)
         
+        self.active = active
         self.logger = logging.getLogger(name)
         
         if self.logger.hasHandlers():
@@ -60,25 +61,29 @@ class Logger:
         self._log_experiment_header()
     
     def _log_experiment_header(self):
-        self.logger.info(f"[Experiment] {self.name}")
-        self.logger.info(f"[Start] {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        if self.log_dir:
-            self.logger.info(f"[Log Dir] {os.path.abspath(self.log_dir)}")
-        if self.enable_tensorboard:
-            self.logger.info(f"[TensorBoard] Enabled")
+        if self.active:
+            self.logger.info(f"[Experiment] {self.name}")
+            self.logger.info(f"[Start] {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            if self.log_dir:
+                self.logger.info(f"[Log Dir] {os.path.abspath(self.log_dir)}")
+            if self.enable_tensorboard:
+                self.logger.info(f"[TensorBoard] Enabled")
 
     def section(self, title: str):
-        self.logger.info("")
-        self.logger.info(f">>> {str(title).upper()}")
+        if self.active:
+            self.logger.info("")
+            self.logger.info(f">>> {str(title).upper()}")
     
     def subsection(self, title: str):
-        self.logger.info(f"  > {title}")
+        if self.active:
+            self.logger.info(f"  > {title}")
     
     def experiment_config(self, config_dict: dict, title: str = "Configuration"):
-        self.logger.info(f"  > {title}")
-        max_key_len = max(len(str(k)) for k in config_dict.keys()) if config_dict else 0
-        for key, value in config_dict.items():
-            self.logger.info(f"    {str(key):<{max_key_len}} : {value}")
+        if self.active:
+            self.logger.info(f"  > {title}")
+            max_key_len = max(len(str(k)) for k in config_dict.keys()) if config_dict else 0
+            for key, value in config_dict.items():
+                self.logger.info(f"    {str(key):<{max_key_len}} : {value}")
     
     def metrics_table(self, headers: list = None, rows: list = None, title: str = "Metrics", metrics: dict = None, precision: int = 4):
         self.logger.info(f"  > {title}")
@@ -108,19 +113,24 @@ class Logger:
         self.logger.info(f"{prefix} [{current}/{total}] ({percentage:.1f}%) {suffix}")
 
     def debug(self, message: str):
-        self.logger.debug(message)
+        if self.active:
+            self.logger.debug(message)
     
     def info(self, message: str):
-        self.logger.info(message)
+        if self.active:
+            self.logger.info(message)
     
     def warning(self, message: str):
-        self.logger.warning(message)
+        if self.active:
+            self.logger.warning(message)
         
     def error(self, message: str):
-        self.logger.error(message)
+        if self.active:
+            self.logger.error(message)
     
     def critical(self, message: str):
-        self.logger.critical(message)
+        if self.active:
+            self.logger.critical(message)
     
     def log_scalar(self, tag: str, value: float, step: int):
         if self.writer:

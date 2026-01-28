@@ -79,12 +79,13 @@ class Trainer:
         target_scaler=None,
         feature_scaler=None,
         embedding_dimensions=None,
-        log_dir = None
+        log_dir = None,
+        active=True,
     ):
         if config.device is None:
             config.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(config.device)
-        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir)
+        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir, active=active)
 
         self.logger.section("Trainer Initialization")
         self.logger.info(f"[Device] Using: {self.device}")

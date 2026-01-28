@@ -8,8 +8,9 @@ from core.logger import Logger
 
 
 class Preprocessor:  
-    def __init__(self):
-        self.logger = Logger(name="Preprocessor", level="INFO", log_dir=None)
+    def __init__(self, active=True):
+        self.active = active
+        self.logger = Logger(name="Preprocessor", level="INFO", log_dir=None, active=self.active)
     
     def filter_category(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         category_col = config.columns.category_col
@@ -56,8 +57,9 @@ class Preprocessor:
 
 class FeatureEngineer:
        
-    def __init__(self):
-        self.logger = Logger(name="FeatureEngineer", level="INFO", log_dir=None)
+    def __init__(self, active=True):
+        self.active = active
+        self.logger = Logger(name="FeatureEngineer", level="INFO", log_dir=None, active=self.active)
     
     def create_temporal_features(self, dataframe: pd.DataFrame) -> pd.DataFrame: 
         due_date_col = config.columns.due_date_col
@@ -196,10 +198,11 @@ class FeatureEngineer:
 
 
 class DataPipeline:
-    def __init__(self):
-        self.logger = Logger(name="DataPipeline", level="INFO", log_dir=None)
-        self.preprocessor = Preprocessor()
-        self.feature_engineer = FeatureEngineer()
+    def __init__(self, active=True):
+        self.active = active
+        self.logger = Logger(name="DataPipeline", level="INFO", log_dir=None, active=self.active)
+        self.preprocessor     = Preprocessor(active=self.active)
+        self.feature_engineer = FeatureEngineer(active=self.active)
     
     def _load_data(self, input_path: str) -> pd.DataFrame:
         dataframe = pd.read_parquet(input_path)

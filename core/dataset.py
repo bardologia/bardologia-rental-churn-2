@@ -92,7 +92,7 @@ class Augmentation:
 
 
 class SequentialDataset(Dataset):
-    def __init__(self, categorical_data, continuous_data, targets, indices, augment=False, mask_last_cont=None, last_known_idx=None):
+    def __init__(self, categorical_data, continuous_data, targets, indices, augment=False, mask_last_cont=None, last_known_idx=None, active=True):
         self.categorical_data = torch.as_tensor(categorical_data, dtype=torch.long)
         self.continuous_data = torch.as_tensor(continuous_data, dtype=torch.float32)
         self.targets = torch.as_tensor(targets, dtype=torch.float32)
@@ -100,7 +100,8 @@ class SequentialDataset(Dataset):
         self.augment = config.augmentation.enabled and augment
         self.augment_probability = config.augmentation.probability
         self.augmenter = Augmentation()
-        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=None)
+        self.active = active
+        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=None, active=self.active)
 
         self.mask_last_cont = mask_last_cont or []  
         self.last_known_idx = last_known_idx 
@@ -154,6 +155,7 @@ class DatasetLoader:
         self, 
         data_path,    
         embedding_dimensions=None,
+        active=True,
     ):
         self.data_path = data_path
         self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=None)
@@ -167,6 +169,7 @@ class DatasetLoader:
         self.target_scalers = {}
         self.embedding_dimensions = list(embedding_dimensions) if embedding_dimensions is not None else []
 
+        self.active = active
 
     def dataloader_pipeline(self):
         self.logger.section("Dataloader Pipeline")
@@ -535,9 +538,9 @@ class DatasetLoader:
         train_continuous,  validation_continuous,  test_continuous  = continuous
         train_categorical, validation_categorical, test_categorical = categorical
         
-        train_dataset      = SequentialDataset(train_categorical, train_continuous, train_targets, train_indices, augment=True,  mask_last_cont=mask_idxs, last_known_idx=known_idx)
-        validation_dataset = SequentialDataset(validation_categorical, validation_continuous, validation_targets, validation_indices, augment=False,  mask_last_cont=mask_idxs, last_known_idx=known_idx)        
-        test_dataset       = SequentialDataset(test_categorical, test_continuous, test_targets, test_indices, augment=False,  mask_last_cont=mask_idxs, last_known_idx=known_idx)
+        train_dataset      = SequentialDataset(train_categorical, train_continuous, train_targets, train_indices, augment=True,  mask_last_cont=mask_idxs, last_known_idx=known_idx, active=self.active)
+        validation_dataset = SequentialDataset(validation_categorical, validation_continuous, validation_targets, validation_indices, augment=False,  mask_last_cont=mask_idxs, last_known_idx=known_idx, active=self.active)        
+        test_dataset       = SequentialDataset(test_categorical, test_continuous, test_targets, test_indices, augment=False,  mask_last_cont=mask_idxs, last_known_idx=known_idx, active=self.active)
     
         self.logger.info(f"[Datasets] Created training dataset with {len(train_dataset):,} samples")
         self.logger.info(f"[Datasets] Created validation dataset with {len(validation_dataset):,} samples")
