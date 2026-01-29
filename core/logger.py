@@ -15,7 +15,7 @@ class Logger:
         'CRITICAL': logging.CRITICAL
     }
     
-    def __init__(self, log_dir="logs", name="experiment", level="INFO", enable_tensorboard=True):
+    def __init__(self, log_dir="logs", name="experiment", level="INFO", enable_tensorboard=False):
         self.log_dir = log_dir
         self.name = name
         self.start_time = datetime.now()
@@ -55,6 +55,23 @@ class Logger:
         self.writer = None
         if enable_tensorboard and log_dir:
             tensorboard_dir = os.path.join(self.log_dir, 'tensorboard')
+            try:
+                os.makedirs(tensorboard_dir, exist_ok=True)
+            except Exception as e:
+                # If a file exists where a directory should be, try to back it up and create the directory
+                if os.path.exists(tensorboard_dir) and not os.path.isdir(tensorboard_dir):
+                    backup_path = tensorboard_dir + '.bak'
+                    try:
+                        os.rename(tensorboard_dir, backup_path)
+                        self.logger.warning(f"Renamed existing file {tensorboard_dir} to {backup_path} to create tensorboard directory.")
+                        os.makedirs(tensorboard_dir, exist_ok=True)
+                    except Exception as e2:
+                        self.logger.error(f"Failed to create tensorboard dir {tensorboard_dir}: {e2}")
+                        raise
+                else:
+                    self.logger.error(f"Failed to create tensorboard dir {tensorboard_dir}: {e}")
+                    raise
+
             self.writer = SummaryWriter(log_dir=tensorboard_dir)
         
         self._log_experiment_header()

@@ -1,5 +1,7 @@
 import sys
 import os
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 from unittest import loader
 import torch
 import numpy as np
@@ -42,6 +44,10 @@ def main():
         pipeline.run(raw_path, data_path)
         print(f"Generated new training data: {data_path}")
     
+    # Ensure run and checkpoint directories exist before initializing the logger
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     logger = Logger(name="train", level="INFO", log_dir=run_dir)
     trainer = None
 

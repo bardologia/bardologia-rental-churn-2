@@ -261,33 +261,76 @@ class Trainer:
         return average_loss
     
     def _metrics(self, den_targets, den_preds, average_loss):
-        mae = np.mean(np.abs(den_preds - den_targets))
-        rmse = np.sqrt(np.mean((den_preds - den_targets) ** 2))
-        ss_res = np.sum((den_targets - den_preds) ** 2)
-        ss_tot = np.sum((den_targets - np.mean(den_targets)) ** 2)
+        den_targets = np.asarray(den_targets).reshape(-1)
+        den_preds = np.asarray(den_preds).reshape(-1)
+
+        diff = np.abs(den_preds - den_targets)
+        total = den_targets.size
+
+        if total == 0:
+            nan = float('nan')
+            metrics = {
+                'loss': average_loss,
+                'mae': nan,
+                'rmse': nan,
+                'r2': nan,
+                'std_error': nan,
+                'p50': nan,
+                'p90': nan,
+                'p99': nan,
+                'mape': nan,
+                'medae': nan,
+                'max_error': nan,
+                'error_bin_0_5': 0.0,
+                'error_bin_5_10': 0.0,
+                'error_bin_10_15': 0.0,
+                'error_bin_15_20': 0.0,
+                'error_bin_20_25': 0.0,
+                'error_bin_above_25': 0.0,
+                'error_target_0_5': nan,
+                'error_target_5_10': nan,
+                'error_target_10_15': nan,
+                'error_target_15_20': nan,
+                'error_target_20_25': nan,
+                'error_target_above_25': nan
+            }
+
+            return metrics
+
+        mae = np.nanmean(diff)
+        rmse = np.sqrt(np.nanmean((den_preds - den_targets) ** 2))
+        ss_res = np.nansum((den_targets - den_preds) ** 2)
+        ss_tot = np.nansum((den_targets - np.nanmean(den_targets)) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float('nan')
-        p50 = np.percentile(np.abs(den_preds - den_targets), 50)
-        p90 = np.percentile(np.abs(den_preds - den_targets), 90)
-        p99 = np.percentile(np.abs(den_preds - den_targets), 99)
+        p50 = np.percentile(diff, 50) if diff.size > 0 else float('nan')
+        p90 = np.percentile(diff, 90) if diff.size > 0 else float('nan')
+        p99 = np.percentile(diff, 99) if diff.size > 0 else float('nan')
 
-        std_error = np.std(den_preds - den_targets)
-        mape = mean_absolute_percentage_error(den_targets, den_preds)
-        medae = median_absolute_error(den_targets, den_preds)
-        max_error = np.max(np.abs(den_targets - den_preds))
+        std_error = np.nanstd(den_preds - den_targets)
+        mape = mean_absolute_percentage_error(den_targets, den_preds) if diff.size > 0 else float('nan')
+        medae = median_absolute_error(den_targets, den_preds) if diff.size > 0 else float('nan')
+        max_error = np.nanmax(diff) if diff.size > 0 else float('nan')
 
-        error_bin_0_5      = np.mean(np.abs(den_targets - den_preds) <= 5) * 100
-        error_bin_5_10     = np.mean((np.abs(den_targets - den_preds) > 5) & (np.abs(den_targets - den_preds) <= 10)) * 100
-        error_bin_10_15    = np.mean((np.abs(den_targets - den_preds) > 10) & (np.abs(den_targets - den_preds) <= 15)) * 100
-        error_bin_15_20    = np.mean((np.abs(den_targets - den_preds) > 15) & (np.abs(den_targets - den_preds) <= 20)) * 100
-        error_bin_20_25    = np.mean((np.abs(den_targets - den_preds) > 20) & (np.abs(den_targets - den_preds) <= 25)) * 100
-        error_bin_above_25 = np.mean(np.abs(den_targets - den_preds) > 25) * 100
+        # Binned percentages: if total > 0 compute percentage, else 0
+        error_bin_0_5      = np.mean(diff <= 5) * 100 if total > 0 else 0.0
+        error_bin_5_10     = np.mean((diff > 5) & (diff <= 10)) * 100 if total > 0 else 0.0
+        error_bin_10_15    = np.mean((diff > 10) & (diff <= 15)) * 100 if total > 0 else 0.0
+        error_bin_15_20    = np.mean((diff > 15) & (diff <= 20)) * 100 if total > 0 else 0.0
+        error_bin_20_25    = np.mean((diff > 20) & (diff <= 25)) * 100 if total > 0 else 0.0
+        error_bin_above_25 = np.mean(diff > 25) * 100 if total > 0 else 0.0
 
-        error_target_0_5 = np.mean(np.abs(den_targets - den_preds)[den_targets.flatten() <= 5])
-        error_target_5_10 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 5) & (den_targets.flatten() <= 10)])
-        error_target_10_15 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 10) & (den_targets.flatten() <= 15)])
-        error_target_15_20 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 15) & (den_targets.flatten() <= 20)])
-        error_target_20_25 = np.mean(np.abs(den_targets - den_preds)[(den_targets.flatten() > 20) & (den_targets.flatten() <= 25)])
-        error_target_above_25 = np.mean(np.abs(den_targets - den_preds)[den_targets.flatten() > 25])
+        t = den_targets.flatten()
+        err = np.abs(den_targets - den_preds)
+        def _subset_mean(mask):
+            s = err[mask]
+            return np.nanmean(s) if s.size > 0 else float('nan')
+
+        error_target_0_5 = _subset_mean(t <= 5)
+        error_target_5_10 = _subset_mean((t > 5) & (t <= 10))
+        error_target_10_15 = _subset_mean((t > 10) & (t <= 15))
+        error_target_15_20 = _subset_mean((t > 15) & (t <= 20))
+        error_target_20_25 = _subset_mean((t > 20) & (t <= 25))
+        error_target_above_25 = _subset_mean(t > 25)
 
         metrics = {
             'loss': average_loss,

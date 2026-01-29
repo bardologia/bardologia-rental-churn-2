@@ -6,7 +6,7 @@ from typing import List, Optional
 class PathsDetails:
     raw_data             : str = "data/raw_data.parquet"
     train_data           : str = "data/training_data.parquet"
-    runs_dir             : str = "Runs"
+    runs_dir             : str = "runs"
     checkpoints_dir      : str = "checkpoints"
     best_model_name      : str = "best_model.pth"
     last_checkpoint_name : str = "last_checkpoint.pth"
@@ -67,9 +67,9 @@ class ModelParams:
     mixed_precision: bool = True
     max_grad_norm: float = 3.0
    
-    num_workers: int = 8
+    num_workers: int = 0
     pin_memory: bool = True
-    persistent_workers: bool = True
+    persistent_workers: bool = False
     prefetch_factor: int = 4
     
     hidden_dim: int = 128
@@ -101,8 +101,8 @@ class ModelParams:
     categorical_padding_value: int = 0
     continuous_padding_value: float = 0.0
     
-    overfit_epochs: int = 1000
-    overfit_patience: int = 1000
+    overfit_epochs: int = 100
+    overfit_patience: int = 100
     overfit_dropout: float = 0.0
     overfit_weight_decay: float = 0.0
     overfit_num_users: int = 3
@@ -114,7 +114,7 @@ class ModelParams:
     overfit_mixed_precision: bool = False
 
 
-    overfit_single_batch: bool = False
+    overfit_single_batch: bool = True
 
 
 @dataclass
