@@ -1,12 +1,10 @@
-# feature_ablation.py
 import os
 
 from tqdm import tqdm
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-import copy
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Any
 
 import pandas as pd
 import torch
@@ -23,40 +21,20 @@ class FeatureAblation:
         data_path: str,
         output_dir: str = "runs/ablation",
         metric: str = "rmse",
-        user_sample_num: int = 500,
     ):
         self.data_path = data_path
         self.output_dir = output_dir
         self.metric = metric
-        self.user_sample_num = int(user_sample_num)
 
         os.makedirs(self.output_dir, exist_ok=True)
 
         self._original_categorical_columns = list(config.columns.cat_cols)
         self._original_continuous_columns = list(config.columns.cont_cols)
-        self._original_user_sample_num = config.data.user_sample_num
+        self._original_user_sample_num = config.load.user_sample_count
 
         self.protected = ["target_days_to_payment", "delay_clipped", "delay_is_known"]
-
  
     def run(self) -> pd.DataFrame:
-
-        config.data.user_sample_num = self.user_sample_num
-        if config.model.overfit_single_batch:
-            config.model.dropout  = config.model.overfit_dropout
-            config.model.embedding_dropout = config.model.overfit_dropout
-            config.model.use_augmentation = config.model.overfit_use_augmentation
-            config.model.weight_decay = config.model.overfit_weight_decay
-            config.model.patience = 5
-            config.model.epochs = 5
-            config.model.scheduler_patience = 5
-            config.model.mixed_precision = config.model.overfit_mixed_precision
-            config.model.use_ema = config.model.overfit_use_ema
-            config.data.val_size = config.model.overfit_val_size
-            config.data.test_size = config.model.overfit_test_size
-            config.data.user_sample_num = config.model.overfit_num_users
-            config.model.min_seq_len = config.model.overfit_min_lenghth
-
         try:
             config.columns.cat_cols = list(self._original_categorical_columns)
             config.columns.cont_cols = list(self._original_continuous_columns)
@@ -90,7 +68,7 @@ class FeatureAblation:
         finally:
             config.columns.cat_cols = list(self._original_categorical_columns)
             config.columns.cont_cols = list(self._original_continuous_columns)
-            config.data.user_sample_num = self._original_user_sample_num
+            config.load.user_sample_count = self._original_user_sample_num
 
     def _remove_feature(self, feat: str):
         if feat in self.protected:
@@ -117,12 +95,13 @@ class FeatureAblation:
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.cuda.empty_cache()
 
-        data = DatasetLoader(self.data_path)
+        data = DatasetLoader(self.data_path, config)
         train_loader, val_loader, test_loader = data.dataloader_pipeline()
 
         model = Model(
             data.embedding_dimensions,
             len(data.continuous_columns),
+            cfg=config,
         )
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

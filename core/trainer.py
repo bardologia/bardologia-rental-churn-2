@@ -7,62 +7,73 @@ from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import mean_absolute_percentage_error, median_absolute_error
 import numpy as np
-import copy
 import os
-import math
-from tqdm import tqdm
-
+import copy
+from core.config import config as _global_config
 from core.logger import Logger
-from core.config import config
+from tqdm.auto import tqdm
 
 
 class EMA:
-    def __init__(self, model: nn.Module):
+    def __init__(self, model, cfg=None, decay=None, step_threshold=None):
+        cfg = cfg or _global_config
         self.model = model
-        self.decay = config.model.ema_decay
-        self.warmup_steps = config.model.ema_warmup_steps
-        self.step = 0
-        
-        self.shadow = {}
+        self.decay = decay if decay is not None else cfg.ema.decay
+        self.step_threshold = step_threshold if step_threshold is not None else cfg.ema.step_threshold
+        self.shadow = {name: param.clone().detach() for name, param in model.named_parameters()}
         self.backup = {}
-        
-        for name, param in model.named_parameters():
+        self.num_updates = 0
+
+    def update(self):
+        self.num_updates += 1
+        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-    
-    def _get_decay(self) -> float:
-        if self.step < self.warmup_steps:
-            return min(self.decay, (1 + self.step) / (config.model.ema_warmup_denominator + self.step))
-        return self.decay
+                assert name in self.shadow
+                new_average = (1.0 - d) * param.data + d * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
     
     @torch.no_grad()
     def update(self):
         decay = self._get_decay()
         self.step += 1
-        
+
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
-    
+
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.backup[name] = param.data.clone()
                 param.data.copy_(self.shadow[name])
-    
+
     def restore(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.backup:
                 param.data.copy_(self.backup[name])
         self.backup = {}
-    
+
     def state_dict(self):
         return {
             'shadow': self.shadow,
             'step': self.step,
             'decay': self.decay
         }
-    
+
     def load_state_dict(self, state_dict):
         self.shadow = state_dict['shadow']
         self.step = state_dict['step']
@@ -79,44 +90,56 @@ class Trainer:
         target_scaler=None,
         feature_scaler=None,
         embedding_dimensions=None,
-        log_dir = None
+        log_dir=None,
+        cfg=None,
     ):
-        if config.model.device is None:
-            config.model.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(config.model.device)
+        self.config = cfg or _global_config
+
+        if self.config.training.device is None:
+            self.config.training.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self.device = torch.device(self.config.training.device)
         self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir)
 
         self.logger.section("Trainer Initialization")
         self.logger.info(f"[Device] Using: {self.device}")
-        self.logger.info(f"[GPU] Name: {torch.cuda.get_device_name(0)}")
-        self.logger.info(f"[GPU] Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-        self.logger.info(f"[GPU] CUDA Version: {torch.version.cuda} \n")
+        try:
+            self.logger.info(f"[GPU] Name: {torch.cuda.get_device_name(0)}")
+            self.logger.info(f"[GPU] Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            self.logger.info(f"[GPU] CUDA Version: {torch.version.cuda} \n")
+        except Exception:
+            self.logger.info("[GPU] CUDA not available or query failed.\n")
 
         self._log_parameters(model)
 
         self.model = model.to(self.device)
-        
+
         self.train_loader = train_loader
         self.validation_loader = validation_loader
         self.target_scaler = target_scaler
         self.feature_scaler = feature_scaler
         self.embedding_dimensions = embedding_dimensions or []
-        self.high_target_weight = config.model.high_target_weight
+        self.high_target_weight = self.config.training.high_target_weight
         self.logger.info(f"[High Target Weight] Using high target weight: {self.high_target_weight}\n")
 
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
-        self.criterion = nn.SmoothL1Loss(reduction='none') 
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=config.model.lr, weight_decay=config.model.weight_decay)
-        self.scaler    = GradScaler() if config.model.mixed_precision else None
-        
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode=config.model.scheduler_mode, factor=config.model.scheduler_factor, patience=config.model.scheduler_patience)
+
+        self.criterion = nn.SmoothL1Loss(reduction='none')
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.training.lr, weight_decay=self.config.training.weight_decay)
+        self.scaler = GradScaler() if self.config.training.mixed_precision else None
+
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer,
+            mode=self.config.scheduler.scheduler_mode,
+            factor=self.config.scheduler.scheduler_factor,
+            patience=self.config.scheduler.scheduler_patience,
+        )
         self.global_step = 0
-        
+
         self.ema = None
-        if config.model.use_ema:
-            self.ema = EMA(self.model)
+        if self.config.ema.use_ema:
+            self.ema = EMA(self.model, cfg=self.config)
           
     def _log_parameters(self, model):
         self.logger.section("[Model Parameter Counts]")
@@ -173,15 +196,15 @@ class Trainer:
             'embedding_dimensions': list(self.embedding_dimensions) if self.embedding_dimensions is not None else [],
         }
         
-        last_path = os.path.join(self.checkpoint_dir, config.paths.last_checkpoint_name)
+        last_path = os.path.join(self.checkpoint_dir, self.config.paths.last_checkpoint_name)
         torch.save(state, last_path)
         
         if is_best:
-            best_path = os.path.join(self.checkpoint_dir, config.paths.best_model_name)
+            best_path = os.path.join(self.checkpoint_dir, self.config.paths.best_model_name)
             torch.save(state, best_path)
             
             if self.ema:
-                ema_path = os.path.join(self.checkpoint_dir, config.paths.best_model_ema_name)
+                ema_path = os.path.join(self.checkpoint_dir, self.config.paths.best_model_ema_name)
                 self.ema.apply_shadow()
                 torch.save(self.model.state_dict(), ema_path)
                 self.ema.restore()
@@ -193,12 +216,12 @@ class Trainer:
         if self.scaler:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.model.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
             self.scaler.step(self.optimizer)   
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), config.model.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
             self.optimizer.step()
 
         self.global_step += 1
@@ -211,7 +234,7 @@ class Trainer:
         running_loss = torch.tensor(0.0, device=self.device)
         num_batches = 0
         
-        if config.model.overfit_single_batch:
+        if self.config.overfit.overfit_single_batch:
             single_batch = next(iter(self.train_loader))
             loop = tqdm(range(len(self.train_loader)), desc=f"Train Epoch {epoch} (Overfit Single Batch)")
             for _ in loop:
@@ -224,7 +247,7 @@ class Trainer:
                 
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
+                with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
                     preds = self.model(categorical_features, continuous_features, lengths)
                     target_tensor = targets.view(-1)
                     loss = self._weighted_loss(preds, target_tensor)
@@ -244,7 +267,7 @@ class Trainer:
                 
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                with autocast(device_type=self.device.type, enabled=config.model.mixed_precision):
+                with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
                     preds = self.model(categorical_features, continuous_features, lengths)
                     target_tensor = targets.view(-1)
                     loss = self._weighted_loss(preds, target_tensor)
@@ -311,7 +334,6 @@ class Trainer:
         medae = median_absolute_error(den_targets, den_preds) if diff.size > 0 else float('nan')
         max_error = np.nanmax(diff) if diff.size > 0 else float('nan')
 
-        # Binned percentages: if total > 0 compute percentage, else 0
         error_bin_0_5      = np.mean(diff <= 5) * 100 if total > 0 else 0.0
         error_bin_5_10     = np.mean((diff > 5) & (diff <= 10)) * 100 if total > 0 else 0.0
         error_bin_10_15    = np.mean((diff > 10) & (diff <= 15)) * 100 if total > 0 else 0.0
@@ -365,6 +387,7 @@ class Trainer:
         self.model.eval()
         if use_ema and self.ema:
             self.ema.apply_shadow()
+        
         all_preds = []
         all_targets = []
         running_loss = torch.tensor(0.0, device=self.device)
@@ -414,7 +437,7 @@ class Trainer:
         best_ema_state = None
         
         patience_counter = 0
-        for epoch in range(1, config.model.epochs + 1):
+        for epoch in range(1, self.config.training.epochs + 1):
             train_loss = self.train_epoch(epoch=epoch)
             validation_metrics = self.evaluate(self.validation_loader, use_ema=True)
             validation_rmse = validation_metrics['rmse']
@@ -431,8 +454,8 @@ class Trainer:
                 self.logger.info(f" New Best Model: RMSE={validation_rmse:.4f}")
             else:
                 patience_counter += 1
-                if patience_counter >= config.model.patience:
-                    self.logger.warning(f"[Early Stopping] Training halted at epoch {epoch} (patience={config.model.patience}). Best RMSE: {best_rmse:.4f}")
+                if patience_counter >= self.config.training.patience:
+                    self.logger.warning(f"[Early Stopping] Training halted at epoch {epoch} (patience={self.config.training.patience}). Best RMSE: {best_rmse:.4f}")
                     break
         
         if best_model_state is not None:

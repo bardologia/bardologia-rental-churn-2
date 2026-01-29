@@ -2,11 +2,9 @@ import sys
 import os
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-from unittest import loader
 import torch
 import numpy as np
 from datetime import datetime
-import argparse
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -28,7 +26,6 @@ from core.logger import Logger
 
 
 def main():
-
     project_root = current_dir 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(project_root, config.paths.runs_dir, run_id)
@@ -44,38 +41,39 @@ def main():
         pipeline.run(raw_path, data_path)
         print(f"Generated new training data: {data_path}")
     
-    # Ensure run and checkpoint directories exist before initializing the logger
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     logger = Logger(name="train", level="INFO", log_dir=run_dir)
     trainer = None
 
-    if config.model.overfit_single_batch:
-        config.model.dropout  = config.model.overfit_dropout
-        config.model.embedding_dropout = config.model.overfit_dropout
-        config.model.use_augmentation = config.model.overfit_use_augmentation
-        config.model.weight_decay = config.model.overfit_weight_decay
-        config.model.patience = config.model.overfit_patience
-        config.model.epochs = config.model.overfit_epochs
-        config.model.scheduler_patience = config.model.overfit_patience
-        config.model.mixed_precision = config.model.overfit_mixed_precision
-        config.model.use_ema = config.model.overfit_use_ema
-        config.data.val_size = config.model.overfit_val_size
-        config.data.test_size = config.model.overfit_test_size
-        config.data.user_sample_num = config.model.overfit_num_users
-        config.model.min_seq_len = config.model.overfit_min_lenghth
+    if config.overfit.overfit_single_batch:
+        config.training.dropout  = config.overfit.overfit_dropout
+        config.architecture.embedding_dropout = config.overfit.overfit_dropout
+        config.architecture.use_augmentation = config.overfit.overfit_use_augmentation
+        config.training.weight_decay = config.overfit.overfit_weight_decay
+        config.training.patience = config.overfit.overfit_patience
+        config.training.epochs = config.overfit.overfit_epochs
+        config.scheduler.scheduler_patience = config.overfit.overfit_patience
+        config.training.mixed_precision = config.overfit.overfit_mixed_precision
+        config.ema.use_ema = config.overfit.overfit_use_ema
+        config.split.val_size = config.overfit.overfit_val_size
+        config.split.test_size = config.overfit.overfit_test_size
+        config.load.user_sample_count = config.overfit.overfit_number_of_users
+        config.architecture.min_seq_len = config.overfit.overfit_min_length
         logger.warning("Overfit single batch mode: Disabled dropout, augmentation, weight decay, mixed precision, and increased epochs and patience.")
 
     try:
-        data_module = DatasetLoader(data_path)
-        
+        data_module = DatasetLoader(data_path, config)
         train_loader, validation_loader, test_loader = data_module.dataloader_pipeline()
-        
         target_scaler = data_module.target_scalers[config.columns.target_col_name]
         continuous_scalers  = data_module.continuous_scalers 
 
-        model   = Model(embedding_dimensions=data_module.embedding_dimensions, num_continuous=len(data_module.continuous_columns))    
+        model = Model(
+            embedding_dimensions = data_module.embedding_dimensions,             
+            num_continuous = len(data_module.continuous_columns), 
+            cfg = config
+        )    
 
         trainer = Trainer(
             model=model,

@@ -8,12 +8,13 @@ from core.logger import Logger
 
 
 class Preprocessor:  
-    def __init__(self):
+    def __init__(self, cfg):
+        self.config = cfg
         self.logger = Logger(name="Preprocessor", level="INFO", log_dir=None)
     
     def filter_category(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        category_col = config.columns.category_col
-        category_filter = config.columns.category_filter
+        category_col = self.config.columns.category_col
+        category_filter = self.config.columns.category_filter
 
         before = len(dataframe)
         dataframe = dataframe[dataframe[category_col].astype(str).str.lower().str.contains(category_filter)]
@@ -23,14 +24,14 @@ class Preprocessor:
         return dataframe
 
     def drop_columns(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        columns_to_drop = [column for column in config.columns.drop_cols if column in dataframe.columns]
+        columns_to_drop = [column for column in self.config.columns.drop_cols if column in dataframe.columns]
         dataframe = dataframe.drop(columns=columns_to_drop)
         self.logger.info(f"[Column Pruning] Removed {len(columns_to_drop)} columns \n")
         return dataframe
 
     def process_dates(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        due_date_col = config.columns.due_date_col
-        date_cols_processed = [col for col in config.columns.date_cols if col in dataframe.columns]
+        due_date_col = self.config.columns.due_date_col
+        date_cols_processed = [col for col in self.config.columns.date_cols if col in dataframe.columns]
         
         for column in date_cols_processed:
             dataframe[column] = pd.to_datetime(dataframe[column], errors='coerce', utc=True)
@@ -55,15 +56,15 @@ class Preprocessor:
 
 
 class FeatureEngineer:
-       
-    def __init__(self):
+    def __init__(self, cfg):
+        self.config = cfg
         self.logger = Logger(name="FeatureEngineer", level="INFO", log_dir=None)
     
     def create_temporal_features(self, dataframe: pd.DataFrame) -> pd.DataFrame: 
-        due_date_col = config.columns.due_date_col
-        weekend_start_day = config.temporal.weekend_start_day
-        days_in_week = config.temporal.days_in_week
-        months_in_year = config.temporal.months_in_year
+        due_date_col = self.config.columns.due_date_col
+        weekend_start_day = self.config.temporal.weekend_start_day
+        days_in_week = self.config.temporal.days_in_week
+        months_in_year = self.config.temporal.months_in_year
         
         d = dataframe[due_date_col]
         days_in_month = d.dt.daysinmonth
@@ -87,9 +88,9 @@ class FeatureEngineer:
         return dataframe
 
     def create_history_features(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        user_col = config.columns.user_id_col
-        delay_col = config.columns.delay_col
-        sort_cols = config.columns.sort_cols
+        user_col = self.config.columns.user_id_col
+        delay_col = self.config.columns.delay_col
+        sort_cols = self.config.columns.sort_cols
 
         def process_user_history(user_df):
             user_df = user_df.sort_values(sort_cols).copy()
@@ -111,12 +112,12 @@ class FeatureEngineer:
         return dataframe
 
     def create_sequence_features(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        user_col     = config.columns.user_id_col
-        contract_col = config.columns.contract_id_col
-        order_col    = config.columns.order_col
-        sort_cols    = config.columns.sort_cols
-        delay_col    = config.columns.delay_col
-        due_date_col = config.columns.due_date_col
+        user_col     = self.config.columns.user_id_col
+        contract_col = self.config.columns.contract_id_col
+        order_col    = self.config.columns.order_col
+        sort_cols    = self.config.columns.sort_cols
+        delay_col    = self.config.columns.delay_col
+        due_date_col = self.config.columns.due_date_col
         
         dataframe = dataframe.sort_values(sort_cols).reset_index(drop=True)
         
@@ -127,7 +128,7 @@ class FeatureEngineer:
             
         dataframe['days_since_last_invoice'] = dataframe.groupby(user_col)[due_date_col].diff().dt.days.fillna(0)
     
-        for window_size in config.data.rolling_window_sizes:
+        for window_size in self.config.target.rolling_window_sizes:
             dataframe[f'rolling_mean_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).mean().shift(1)).fillna(0).clip(lower=0)
             dataframe[f'rolling_max_delay_{window_size}'] = dataframe.groupby(user_col)[delay_col].transform(lambda values: values.rolling(window_size, min_periods=1).max().shift(1)).fillna(0).clip(lower=0)
 
@@ -146,18 +147,18 @@ class FeatureEngineer:
         return dataframe
 
     def create_value_features(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        user_col = config.columns.user_id_col
-        billed_value_col = config.columns.billed_value_col
-        payed_value_col = config.columns.payed_value_col
-        sort_cols = config.columns.sort_cols
-        due_date_col = config.columns.due_date_col
-        criation_date_col = config.columns.criation_date_col
+        user_col = self.config.columns.user_id_col
+        billed_value_col = self.config.columns.billed_value_col
+        paid_value_col = self.config.columns.paid_value_col
+        sort_cols = self.config.columns.sort_cols
+        due_date_col = self.config.columns.due_date_col
+        creation_date_col = self.config.columns.creation_date_col
 
-        dataframe['grace_period'] = (dataframe[due_date_col] - dataframe[criation_date_col]).dt.days 
+        dataframe['grace_period'] = (dataframe[due_date_col] - dataframe[creation_date_col]).dt.days 
         
         dataframe = dataframe.sort_values(sort_cols).reset_index(drop=True)
         
-        dataframe['total_paid']      = (dataframe.groupby(user_col)[payed_value_col].transform(lambda s: s.expanding().sum().shift(1)).fillna(0))
+        dataframe['total_paid']      = (dataframe.groupby(user_col)[paid_value_col].transform(lambda s: s.expanding().sum().shift(1)).fillna(0))
   
         dataframe['total_billed']    = (dataframe.groupby(user_col)[billed_value_col].transform(lambda s: s.expanding().sum()).fillna(0))
         dataframe['hist_mean_value'] = dataframe.groupby(user_col)[billed_value_col].transform(lambda values: values.expanding().mean().shift(1)).clip(lower=0)
@@ -167,11 +168,11 @@ class FeatureEngineer:
         return dataframe
 
     def create_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        delay_col = config.columns.delay_col
-        target_col = config.columns.target_col_name
-        dataframe[config.columns.delay_clipped_col] = dataframe[delay_col].clip(lower=0)
-        dataframe[config.columns.delay_is_known_col] = config.data.delay_is_known_value
-        dataframe[config.columns.target_col_name] = dataframe[config.columns.delay_clipped_col]
+        delay_col = self.config.columns.delay_col
+        target_col = self.config.columns.target_col_name
+        dataframe[self.config.columns.delay_clipped_col] = dataframe[delay_col].clip(lower=0)
+        dataframe[self.config.columns.delay_is_known_col] = self.config.target.delay_known_value
+        dataframe[self.config.columns.target_col_name] = dataframe[self.config.columns.delay_clipped_col]
         self.logger.info(f"[Target Creation] Created target column: {target_col} from {delay_col} \n")
         return dataframe
 
@@ -196,25 +197,26 @@ class FeatureEngineer:
 
 
 class DataPipeline:
-    def __init__(self):
+    def __init__(self, cfg):
+        self.config = cfg
         self.logger = Logger(name="DataPipeline", level="INFO", log_dir=None)
-        self.preprocessor = Preprocessor()
-        self.feature_engineer = FeatureEngineer()
+        self.preprocessor = Preprocessor(cfg)
+        self.feature_engineer = FeatureEngineer(cfg)
     
     def _load_data(self, input_path: str) -> pd.DataFrame:
         dataframe = pd.read_parquet(input_path)
-        dataframe = dataframe.sample(frac=config.data.sample_frac, random_state=config.data.random_state)
-        self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows from {input_path.split('/')[-1]} (sample_frac={config.data.sample_frac}) \n")
+        dataframe = dataframe.sample(frac=self.config.load.sample_fraction, random_state=self.config.load.random_state)
+        self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows from {input_path.split('/')[-1]} (sample_fraction={self.config.load.sample_fraction}) \n")
         return dataframe
     
     def _finalize_data(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         required_cols = set(
-            config.columns.cat_cols +
-            config.columns.cont_cols +
-            config.columns.target_cols +
-            config.columns.group_cols +
-            config.columns.sort_cols +
-            [config.columns.order_col]
+            self.config.columns.cat_cols +
+            self.config.columns.cont_cols +
+            self.config.columns.target_cols +
+            self.config.columns.group_cols +
+            self.config.columns.sort_cols +
+            [self.config.columns.order_col]
         )
         columns = [col for col in dataframe.columns if col in required_cols]
 
@@ -226,7 +228,7 @@ class DataPipeline:
         return result_dataframe
     
     def _save_data(self, dataframe: pd.DataFrame, output_path: str) -> None:
-        dataframe = dataframe.sort_values(config.columns.sort_cols)
+        dataframe = dataframe.sort_values(self.config.columns.sort_cols)
         dataframe.to_parquet(output_path, index=False)
         
         numeric_features = dataframe.select_dtypes(include=[np.number]).columns.tolist()
@@ -256,7 +258,7 @@ class DataPipeline:
 
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pipeline = DataPipeline()
+    pipeline = DataPipeline(config)
     raw_path = os.path.join(project_root, config.paths.raw_data)
     train_path = os.path.join(project_root, config.paths.train_data)
     pipeline.run(raw_path, train_path)

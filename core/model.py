@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
-from core.config import config
 
 
 class StochasticDepth(nn.Module):
@@ -58,6 +57,7 @@ class GRN(nn.Module):
         
         if context_dimension is not None:
             self.context_projection = nn.Linear(context_dimension, output_dimension, bias=False)
+        
         self.context_dimension = context_dimension
         
         self.gate_layer = nn.Linear(output_dimension, output_dimension)
@@ -91,11 +91,7 @@ class SwiGLU(nn.Module):
 
 
 class RoPE(nn.Module):
-    def __init__(self, dimension: int, max_sequence_length: int = None, base: float = None):
-        if max_sequence_length is None:
-            max_sequence_length = config.model.max_seq_len
-        if base is None:
-            base = config.model.rope_base
+    def __init__(self, dimension: int, max_sequence_length: int = 512, base: float = 10000.0):
         super().__init__()
         self.dimension = dimension
         self.max_sequence_length = max_sequence_length
@@ -115,24 +111,19 @@ class RoPE(nn.Module):
         return torch.cat([-second_half, first_half], dim=-1)
         
     def forward(self, query: torch.Tensor, key: torch.Tensor, sequence_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Clamp sequence_length to avoid index out of bounds
         actual_length = min(sequence_length, self.max_sequence_length)
         cos_values = self.cos_cached[:, :, :actual_length, :].to(query.dtype)
         sin_values = self.sin_cached[:, :, :actual_length, :].to(query.dtype)
         
-        # If sequence_length > max_sequence_length, compute additional positions dynamically
+       
         if sequence_length > self.max_sequence_length:
-            # Compute additional positions beyond cache
-            additional_positions = torch.arange(
-                self.max_sequence_length, sequence_length, 
-                device=self.inverse_frequency.device
-            ).type_as(self.inverse_frequency)
+            additional_positions = torch.arange(self.max_sequence_length, sequence_length, device=self.inverse_frequency.device).type_as(self.inverse_frequency)
+            
             additional_frequencies = torch.einsum('i,j->ij', additional_positions, self.inverse_frequency)
             additional_embeddings = torch.cat([additional_frequencies, additional_frequencies], dim=-1)
             additional_cos = additional_embeddings.cos().unsqueeze(0).unsqueeze(0)
             additional_sin = additional_embeddings.sin().unsqueeze(0).unsqueeze(0)
             
-            # Concatenate cached and additional values
             cos_values = torch.cat([cos_values, additional_cos], dim=2)
             sin_values = torch.cat([sin_values, additional_sin], dim=2)
         
@@ -156,20 +147,20 @@ class PredictionHead(nn.Module):
 
 class FeatureTokenizer(nn.Module):
     def __init__(
-        self, 
-        cardinalities: list, 
-        num_continuous: int, 
-        token_dimension: int, 
+        self,
+        cardinalities: list,
+        num_continuous: int,
+        token_dimension: int,
+        periodic_sigma: float,
+        embedding_dropout: float,
     ):
         super().__init__()
-        
-        sigma = config.model.periodic_sigma
-        
+
         self.categorical_embeddings = nn.ModuleList([nn.Embedding(cardinality + 1, token_dimension, padding_idx=0) for cardinality in cardinalities])
-        self.embedding_dropout = nn.Dropout(config.model.embedding_dropout)
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
         self.token_dimension = token_dimension
-      
-        self.continuous_embedding = FourierFeatures(num_continuous, token_dimension, sigma=sigma)
+
+        self.continuous_embedding = FourierFeatures(num_continuous, token_dimension, sigma=periodic_sigma)
             
     def forward(self, categorical_features: torch.Tensor, continuous_features: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, _ = categorical_features.shape
@@ -193,10 +184,10 @@ class FeatureTokenizer(nn.Module):
 
 class InvoiceEncoder(nn.Module):
     def __init__(
-        self, 
-        model_dimension: int, 
-        num_heads: int = 4, 
-        num_layers: int = 2, 
+        self,
+        model_dimension: int,
+        num_heads: int = 4,
+        num_layers: int = 2,
         dropout: float = 0.1,
         drop_path_rate: float = 0.1
     ):
@@ -274,8 +265,6 @@ class TransformerBlock(nn.Module):
             pad = key_padding_mask[:, None, None, :]  
             attn_mask = pad if attn_mask is None else (attn_mask | pad) 
 
-        # Use is_causal=True when only causal mask is needed (more efficient)
-        # Use is_causal=False when we have custom attn_mask (padding + causal)
         use_causal_flag = self.is_causal and key_padding_mask is None
         
         attention_output = F.scaled_dot_product_attention(
@@ -366,38 +355,44 @@ class Model(nn.Module):
         self,
         embedding_dimensions: list,
         num_continuous: int,
+        cfg=None,
     ):
         super().__init__()
-        
-        self.hidden_dimension = config.model.hidden_dim
+        self.config = cfg
+
+        self.hidden_dimension = self.config.architecture.hidden_dim
         self.num_categorical = len(embedding_dimensions)
         self.num_continuous = num_continuous
-        
+
         self.tokenizer = FeatureTokenizer(
-            embedding_dimensions, num_continuous, self.hidden_dimension, 
+            embedding_dimensions,
+            num_continuous,
+            self.hidden_dimension,
+            periodic_sigma=self.config.architecture.periodic_sigma,
+            embedding_dropout=self.config.architecture.embedding_dropout,
         )
-        
+
         self.invoice_encoder = InvoiceEncoder(
-            self.hidden_dimension, 
-            num_heads=config.model.n_heads,
-            num_layers=config.model.num_invoice_layers, 
-            dropout=config.model.dropout,
-            drop_path_rate=config.model.drop_path_rate
+            self.hidden_dimension,
+            num_heads=self.config.architecture.num_attention_heads,
+            num_layers=self.config.architecture.num_invoice_encoder_layers,
+            dropout=self.config.training.dropout,
+            drop_path_rate=self.config.architecture.drop_path_rate,
         )
-        
+
         self.sequence_encoder = SequenceEncoder(
             self.hidden_dimension,
-            num_heads=config.model.n_heads,
-            num_layers=config.model.num_sequence_layers,
-            dropout=config.model.dropout,
-            drop_path_rate=config.model.drop_path_rate,
-            max_sequence_length=config.model.max_seq_len
+            num_heads=self.config.architecture.num_attention_heads,
+            num_layers=self.config.architecture.num_sequence_encoder_layers,
+            dropout=self.config.training.dropout,
+            drop_path_rate=self.config.architecture.drop_path_rate,
+            max_sequence_length=self.config.architecture.max_seq_len,
         )
-        
-        self.temporal_attention = CrossAttention(self.hidden_dimension, num_heads=config.model.n_heads, dropout=config.model.dropout)
-        
+
+        self.temporal_attention = CrossAttention(self.hidden_dimension, num_heads=self.config.architecture.num_attention_heads, dropout=self.config.training.dropout)
+
         head_input_dimension = self.hidden_dimension * 3
-        self.head_days = PredictionHead(head_input_dimension, self.hidden_dimension, dropout=config.model.dropout, num_outputs=1)
+        self.head_days = PredictionHead(head_input_dimension, self.hidden_dimension, dropout=self.config.training.dropout, num_outputs=1)
         
     def forward(
         self, 

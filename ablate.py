@@ -15,21 +15,21 @@ def main():
     data_path = config.paths.train_data
     output_dir = "runs/ablation"
     metric = "rmse"
-    user_sample_num = 3000
-
-    config.model.hidden_dim = 128
-    config.model.num_layers = 1
-    config.model.num_sequence_layers = 1
-    config.model.n_heads = 4
-    config.model.epochs = 10
-    config.model.patience = 4
-    
+ 
+    config.load.user_sample_count = 300
+    config.architecture.hidden_dim = 128
+    config.architecture.num_invoice_encoder_layers = 1
+    config.architecture.num_sequence_encoder_layers = 1
+    config.architecture.num_attention_heads = 4
+    config.training.epochs = 10
+    config.training.patience = 4
+    config.scheduler.scheduler_patience = 2
+    config.overfit.overfit_single_batch = False
 
     study = FeatureAblation(
         data_path=data_path,
         output_dir=output_dir,
         metric=metric,
-        user_sample_num=user_sample_num,
     )
 
     df = study.run()
