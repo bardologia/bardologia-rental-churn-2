@@ -21,23 +21,22 @@ from core.data import DataPipeline
 from core.dataset import DatasetLoader
 from core.model import Model
 from core.trainer import Trainer
-from core.config import config
+from main.config import config
 from core.logger import Logger
 
 
 def main():
-    project_root = current_dir 
+    project_root = os.path.abspath(os.path.join(current_dir, '..'))
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(project_root, config.paths.runs_dir, run_id)
     checkpoint_dir = os.path.join(run_dir, config.paths.checkpoints_dir)
-    model_save_path = os.path.join(checkpoint_dir, config.paths.best_model_name)
-    
+
     raw_path = os.path.join(project_root, config.paths.raw_data)
     data_path = os.path.join(project_root, config.paths.train_data)
     
     if not os.path.exists(data_path):
         os.makedirs(os.path.dirname(data_path), exist_ok=True)
-        pipeline = DataPipeline()
+        pipeline = DataPipeline(cfg=config)
         pipeline.run(raw_path, data_path)
         print(f"Generated new training data: {data_path}")
     
@@ -64,7 +63,7 @@ def main():
         logger.warning("Overfit single batch mode: Disabled dropout, augmentation, weight decay, mixed precision, and increased epochs and patience.")
 
     try:
-        data_module = DatasetLoader(data_path, config)
+        data_module = DatasetLoader(data_path=data_path, cfg=config, log_dir=run_dir)
         train_loader, validation_loader, test_loader = data_module.dataloader_pipeline()
         target_scaler = data_module.target_scalers[config.columns.target_col_name]
         continuous_scalers  = data_module.continuous_scalers 
@@ -89,12 +88,11 @@ def main():
         best_model = trainer.fit()
         
         trainer.logger.section("Model Persistence")
-        torch.save(best_model.state_dict(), model_save_path)
-        trainer.logger.info(f"[Save] Best model saved to: {model_save_path}")
-        
+        torch.save(best_model.state_dict(), run_dir + "/best_model_final.pth")
+
         last_checkpoint_path = os.path.join(checkpoint_dir, config.paths.last_checkpoint_name)
         trainer.logger.info(f"[Save] Last checkpoint path: {last_checkpoint_path}")
-          
+       
         with torch.inference_mode():
             model.eval()
             metrics = trainer.evaluate(test_loader)

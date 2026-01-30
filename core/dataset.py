@@ -94,6 +94,7 @@ class SequentialDataset(Dataset):
         continuous_data,
         targets,
         indices,
+        log_dir,
         augment=False,
         mask_last_cont=None,
         last_known_idx=None,
@@ -107,7 +108,7 @@ class SequentialDataset(Dataset):
         self.augment = (self.config.architecture.use_augmentation if (self.config is not None and self.config.architecture is not None) else False) and augment
         self.augment_probability = self.config.architecture.augment_prob if (self.config is not None and self.config.architecture is not None) else 0.0
         self.augmenter = Augmentation(self.config.augmentation) if (self.config is not None and self.config.augmentation is not None) else None
-        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=None)
+        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=log_dir)
 
         self.mask_last_cont = mask_last_cont or []
         self.last_known_idx = last_known_idx
@@ -164,12 +165,13 @@ class DatasetLoader:
         self,
         data_path,
         cfg,
-        embedding_dimensions=None,
+        log_dir
     ):
         self.data_path = data_path
         self.config = cfg
+        self.log_dir = log_dir
 
-        self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=None)
+        self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=self.log_dir)
 
         self.categorical_columns = list(self.config.columns.cat_cols)
         self.continuous_columns = list(self.config.columns.cont_cols)
@@ -177,7 +179,7 @@ class DatasetLoader:
 
         self.continuous_scalers = {}
         self.target_scalers = {}
-        self.embedding_dimensions = list(embedding_dimensions) if embedding_dimensions is not None else []
+        self.embedding_dimensions = []
 
 
     def dataloader_pipeline(self):
@@ -429,7 +431,7 @@ class DatasetLoader:
             
             group_indices_set = set(group_indices)
             first_idx = group_indices[0]
-            last_idx = group_indices[-1]
+            last_idx  = group_indices[-1]
             expected_contiguous = set(range(first_idx, last_idx + 1))
             
             if group_indices_set != expected_contiguous:
@@ -548,35 +550,40 @@ class DatasetLoader:
         train_continuous,  validation_continuous,  test_continuous  = continuous
         train_categorical, validation_categorical, test_categorical = categorical
         
-        train_dataset      = SequentialDataset(
-            train_categorical,
-            train_continuous,
-            train_targets,
-            train_indices,
+        train_dataset = SequentialDataset(
+            categorical_data=train_categorical,
+            continuous_data=train_continuous,
+            targets=train_targets,
+            indices=train_indices,
             augment=True,
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
             cfg=self.config,
+            log_dir = self.log_dir 
         )
+        
         validation_dataset = SequentialDataset(
-            validation_categorical,
-            validation_continuous,
-            validation_targets,
-            validation_indices,
-            augment=False,
-            mask_last_cont=mask_idxs,
-            last_known_idx=known_idx,
-            cfg=self.config,
+            categorical_data=validation_categorical,
+            continuous_data=validation_continuous,
+            targets=validation_targets,
+            indices=validation_indices,
+            augment =False,
+            mask_last_cont =mask_idxs,
+            last_known_idx =known_idx,
+            cfg =self.config,
+            log_dir = self.log_dir 
         )
-        test_dataset       = SequentialDataset(
-            test_categorical,
-            test_continuous,
-            test_targets,
-            test_indices,
+        
+        test_dataset = SequentialDataset(
+            categorical_data=test_categorical,
+            continuous_data=test_continuous,
+            targets=test_targets,
+            indices=test_indices,
             augment=False,
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
             cfg=self.config,
+            log_dir = self.log_dir 
         )
     
         self.logger.info(f"[Datasets] Created training dataset with {len(train_dataset):,} samples")

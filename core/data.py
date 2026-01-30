@@ -3,7 +3,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 
-from core.config import config
+from main.config import config
 from core.logger import Logger
 
 

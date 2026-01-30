@@ -13,6 +13,7 @@ class PathsDetails:
     best_model_ema_name  : str = "best_model_ema.pth"
     optuna_tuning_dir    : str = "optuna_tuning"
     optuna_results_dir   : str = "optuna_results"
+    ablation_dir         : str = "ablation"
 
 
 @dataclass
@@ -121,6 +122,20 @@ class OverfitParams:
 
 
 @dataclass
+class AblationParams:
+    user_sample_count: int = 300
+    hidden_dim: int = 128
+    num_invoice_encoder_layers: int = 1
+    num_sequence_encoder_layers: int = 1
+    num_attention_heads: int = 4
+    training_epochs: int = 10
+    patience: int = 4
+    scheduler_patience: int = 2
+    overfit_single_batch: bool = False
+    metric: str = "rmse"
+
+
+@dataclass
 class Columns:
     
     drop_cols: List[str] = field(default_factory=lambda: [
@@ -204,6 +219,7 @@ class Config:
     ema:          EMAParams = field(default_factory=EMAParams)
     scheduler:    SchedulerParams = field(default_factory=SchedulerParams)
     overfit:      OverfitParams = field(default_factory=OverfitParams)
+    ablation:     AblationParams = field(default_factory=AblationParams)
 
 
 config = Config()

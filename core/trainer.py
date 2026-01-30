@@ -9,7 +9,8 @@ from sklearn.metrics import mean_absolute_percentage_error, median_absolute_erro
 import numpy as np
 import os
 import copy
-from core.config import config as _global_config
+from main.config import config as _global_config
+from dataclasses import asdict
 from core.logger import Logger
 from tqdm.auto import tqdm
 
@@ -99,7 +100,9 @@ class Trainer:
             self.config.training.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         self.device = torch.device(self.config.training.device)
-        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir)
+        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir, config=self.config)
+
+        self.logger.save_config_file(cfg=self.config)
 
         self.logger.section("Trainer Initialization")
         self.logger.info(f"[Device] Using: {self.device}")
@@ -194,6 +197,7 @@ class Trainer:
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
             'embedding_dimensions': list(self.embedding_dimensions) if self.embedding_dimensions is not None else [],
+            'configs': asdict(self.config),
         }
         
         last_path = os.path.join(self.checkpoint_dir, self.config.paths.last_checkpoint_name)
@@ -276,11 +280,7 @@ class Trainer:
                 running_loss += loss.detach()
                 num_batches += 1
         
-        average_loss = (running_loss / max(num_batches, 1)).item()
-        if self.logger:
-            self.logger.log_scalar("Loss/train", average_loss, epoch)
-            self.logger.log_scalar("LR", self.optimizer.param_groups[0]['lr'], epoch)
-        
+        average_loss = (running_loss / max(num_batches, 1)).item()    
         return average_loss
     
     def _metrics(self, den_targets, den_preds, average_loss):

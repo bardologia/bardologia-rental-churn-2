@@ -9,7 +9,7 @@ from typing import Dict, Optional, Any
 import pandas as pd
 import torch
 
-from core.config import config
+from main.config import config
 from core.dataset import DatasetLoader
 from core.trainer import Trainer
 from core.model import Model  
@@ -19,11 +19,12 @@ class FeatureAblation:
     def __init__(
         self,
         data_path: str,
-        output_dir: str = "runs/ablation",
+        output_dir: str = None,
         metric: str = "rmse",
     ):
         self.data_path = data_path
-        self.output_dir = output_dir
+        # default to config path for ablation outputs when not provided
+        self.output_dir = output_dir or config.paths.ablation_dir
         self.metric = metric
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -95,7 +96,7 @@ class FeatureAblation:
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.cuda.empty_cache()
 
-        data = DatasetLoader(self.data_path, config)
+        data = DatasetLoader(self.data_path, cfg=config, log_dir=run_dir)
         train_loader, val_loader, test_loader = data.dataloader_pipeline()
 
         model = Model(

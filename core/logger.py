@@ -2,7 +2,9 @@ import logging
 import os
 import sys
 from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
+# TensorBoard support removed — logging only
+import json
+from dataclasses import asdict, is_dataclass
 
 
 class Logger:
@@ -15,10 +17,11 @@ class Logger:
         'CRITICAL': logging.CRITICAL
     }
     
-    def __init__(self, log_dir="logs", name="experiment", level="INFO", enable_tensorboard=False):
+    def __init__(self, log_dir="logs", name="experiment", level="INFO", config=None):
         self.log_dir = log_dir
         self.name = name
         self.start_time = datetime.now()
+        self.config = config
         if log_dir:
             os.makedirs(self.log_dir, exist_ok=True)
         
@@ -50,39 +53,25 @@ class Logger:
         console_handler.setFormatter(console_formatter)
         console_handler.setLevel(log_level)
         self.logger.addHandler(console_handler)
-        
-        self.enable_tensorboard = enable_tensorboard
-        self.writer = None
-        if enable_tensorboard and log_dir:
-            tensorboard_dir = os.path.join(self.log_dir, 'tensorboard')
-            try:
-                os.makedirs(tensorboard_dir, exist_ok=True)
-            except Exception as e:
-                # If a file exists where a directory should be, try to back it up and create the directory
-                if os.path.exists(tensorboard_dir) and not os.path.isdir(tensorboard_dir):
-                    backup_path = tensorboard_dir + '.bak'
-                    try:
-                        os.rename(tensorboard_dir, backup_path)
-                        self.logger.warning(f"Renamed existing file {tensorboard_dir} to {backup_path} to create tensorboard directory.")
-                        os.makedirs(tensorboard_dir, exist_ok=True)
-                    except Exception as e2:
-                        self.logger.error(f"Failed to create tensorboard dir {tensorboard_dir}: {e2}")
-                        raise
-                else:
-                    self.logger.error(f"Failed to create tensorboard dir {tensorboard_dir}: {e}")
-                    raise
-
-            self.writer = SummaryWriter(log_dir=tensorboard_dir)
-        
         self._log_experiment_header()
     
+    def save_config_file(self, cfg):
+        try:
+            cfg_dict = asdict(cfg)
+            config_filename = f"{self.name}_config_{self.start_time.strftime('%Y%m%d_%H%M%S')}.json"
+            config_path = os.path.join(self.log_dir, config_filename)
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(cfg_dict, f, indent=2, default=str, ensure_ascii=False)
+
+            self.logger.info(f"  > Configuration saved: {os.path.abspath(config_path)}")
+        except Exception as e:
+            self.logger.error(f"Failed to serialize config: {e}")
+
     def _log_experiment_header(self):
         self.logger.info(f"[Experiment] {self.name}")
         self.logger.info(f"[Start] {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         if self.log_dir:
             self.logger.info(f"[Log Dir] {os.path.abspath(self.log_dir)}")
-        if self.enable_tensorboard:
-            self.logger.info(f"[TensorBoard] Enabled")
 
     def section(self, title: str):
         self.logger.info("")
@@ -139,102 +128,6 @@ class Logger:
     def critical(self, message: str):
         self.logger.critical(message)
     
-    def log_scalar(self, tag: str, value: float, step: int):
-        if self.writer:
-            self.writer.add_scalar(tag, value, step)
-
-    def log_scalars(self, main_tag: str, tag_scalar_dict: dict, step: int):
-        if self.writer:
-            self.writer.add_scalars(main_tag, tag_scalar_dict, step)
-
-    def log_histogram(self, tag: str, values, step: int):
-        if self.writer:
-            self.writer.add_histogram(tag, values, step)
-
-    def log_figure(self, tag: str, figure, step: int):
-        if self.writer:
-            self.writer.add_figure(tag, figure, step)
-    
-    def log_text(self, tag: str, text: str, step: int):
-        if self.writer:
-            self.writer.add_text(tag, text, step)
-    
-    def log_hyperparams(self, hparam_dict: dict, metric_dict: dict = None):
-        if self.writer:
-            self.writer.add_hparams(hparam_dict, metric_dict or {})
-    
-    def log_model_summary(self, model_name: str = None, num_params: int = None, 
-                          architecture_info: dict = None, model=None):
-        self.logger.info(f"  > Model Architecture")
-        
-        if model is not None:
-            total_params = sum(p.numel() for p in model.parameters())
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            
-            self.logger.info(f"    Total Parameters:     {total_params:,}")
-            self.logger.info(f"    Trainable Parameters: {trainable_params:,}")
-            self.logger.info(f"    Model Size (MB):      {total_params * 4 / (1024**2):.2f}")
-            
-            for name, module in model.named_children():
-                params = sum(p.numel() for p in module.parameters())
-                self.logger.info(f"      {name:<28} : {params:,}")
-        else:
-            if model_name:
-                self.logger.info(f"    Model: {model_name}")
-            if num_params is not None:
-                self.logger.info(f"    Trainable Parameters: {num_params:,}")
-                self.logger.info(f"    Model Size (MB): {num_params * 4 / (1024**2):.2f}")
-            
-            if architecture_info:
-                max_key_len = max(len(str(k)) for k in architecture_info.keys())
-                for key, value in architecture_info.items():
-                    self.logger.info(f"    {str(key):<{max_key_len}} : {value}")
-    
-    def log_training_start(self, num_epochs: int, batch_size: int, learning_rate: float, 
-                           train_samples: int, val_samples: int, test_samples: int):
-        self.logger.info("")
-        self.logger.info(">>> TRAINING")
-        self.logger.info(f"    Epochs: {num_epochs} | Batch: {batch_size} | LR: {learning_rate:.2e}")
-        self.logger.info(f"    Train: {train_samples:,} | Val: {val_samples:,} | Test: {test_samples:,}")
-    
-    def log_epoch_results(self, epoch: int, total_epochs: int, train_loss: float, 
-                          val_loss: float, metrics: dict = None, val_metrics: dict = None,
-                          learning_rate: float = None,
-                          is_best: bool = False, elapsed_time: float = None):
-        
-        status = "★" if is_best else ""
-        time_str = f"({elapsed_time:.1f}s)" if elapsed_time else ""
-        
-        metrics_to_use = metrics if metrics is not None else val_metrics
-        lr = learning_rate if learning_rate is not None else (metrics_to_use.get('LR', 0) if metrics_to_use else 0)
-        
-        metrics_str = ""
-        if metrics_to_use:
-            metrics_parts = []
-            for key, value in metrics_to_use.items():
-                if key == 'LR':
-                    continue
-                if isinstance(value, float):
-                    metrics_parts.append(f"{key}: {value:.4f}")
-            metrics_str = " | ".join(metrics_parts)
-        
-        self.logger.info(
-            f"Epoch [{epoch:03d}/{total_epochs:03d}] {time_str} "
-            f"Loss: {train_loss:.4f}/{val_loss:.4f} | {metrics_str} | LR: {lr:.2e} {status}"
-        )
-    
-    def log_evaluation_results(self, dataset_name: str = None, phase: str = None, metrics: dict = None):
-        title = dataset_name if dataset_name else (str(phase).upper() if phase else "Evaluation")
-        self.logger.info(f"  > {title}")
-        
-        if metrics:
-            max_key_len = max(len(str(k)) for k in metrics.keys())
-            for key, value in metrics.items():
-                if isinstance(value, float):
-                    self.logger.info(f"    {str(key):<{max_key_len}} : {value:.4f}")
-                else:
-                    self.logger.info(f"    {str(key):<{max_key_len}} : {value}")
-    
     def log_experiment_summary(self, best_metrics: dict = None, total_epochs: int = None, 
                                early_stopped: bool = False, stopped_epoch: int = None,
                                notes: str = None):
@@ -265,10 +158,6 @@ class Logger:
         minutes, seconds = divmod(remainder, 60)
         
         self.logger.info(f"[End] Duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
-        
-        if self.writer:
-            self.writer.close()
-        
         for handler in self.logger.handlers[:]:
             handler.close()
             self.logger.removeHandler(handler)
