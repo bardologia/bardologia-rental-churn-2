@@ -1,16 +1,11 @@
 import pandas as pd
 import numpy as np
-import os
-from tqdm import tqdm
-
-from main.config import config
-from core.logger import Logger
 
 
 class Preprocessor:  
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         self.config = cfg
-        self.logger = Logger(name="Preprocessor", level="INFO", log_dir=None)
+        self.logger = logger
     
     def filter_category(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         category_col = self.config.columns.category_col
@@ -24,11 +19,13 @@ class Preprocessor:
         return dataframe
 
     def drop_columns(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        columns_to_drop = [column for column in self.config.columns.drop_cols if column in dataframe.columns]
-        dataframe = dataframe.drop(columns=columns_to_drop)
-        self.logger.info(f"[Column Pruning] Removed {len(columns_to_drop)} columns \n")
+        keep_cols = self.config.columns.keep_cols
+        keep    = [col for col in keep_cols if col in dataframe.columns]
+        removed = [col for col in dataframe.columns if col not in keep]
+        dataframe = dataframe[keep].copy()
+        self.logger.info(f"[Column Pruning] Kept {len(keep)} columns, removed {len(removed)} columns \n")
         return dataframe
-
+    
     def process_dates(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         due_date_col = self.config.columns.due_date_col
         date_cols_processed = [col for col in self.config.columns.date_cols if col in dataframe.columns]
@@ -43,12 +40,12 @@ class Preprocessor:
 
     def run(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         self.logger.section("Preprocessing")
-
-        self.logger.subsection("Filtering by category")
-        dataframe = self.filter_category(dataframe)
         
         self.logger.subsection("Dropping unnecessary columns")
         dataframe = self.drop_columns(dataframe)
+
+        self.logger.subsection("Filtering by category")
+        dataframe = self.filter_category(dataframe)
         
         self.logger.subsection("Processing dates")
         dataframe = self.process_dates(dataframe)   
@@ -56,9 +53,9 @@ class Preprocessor:
 
 
 class FeatureEngineer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         self.config = cfg
-        self.logger = Logger(name="FeatureEngineer", level="INFO", log_dir=None)
+        self.logger = logger
     
     def create_temporal_features(self, dataframe: pd.DataFrame) -> pd.DataFrame: 
         due_date_col = self.config.columns.due_date_col
@@ -197,11 +194,12 @@ class FeatureEngineer:
 
 
 class DataPipeline:
-    def __init__(self, cfg):
+    def __init__(self, cfg, logger):
         self.config = cfg
-        self.logger = Logger(name="DataPipeline", level="INFO", log_dir=None)
-        self.preprocessor = Preprocessor(cfg)
-        self.feature_engineer = FeatureEngineer(cfg)
+        self.logger = logger
+        
+        self.preprocessor     = Preprocessor(cfg, logger)
+        self.feature_engineer = FeatureEngineer(cfg, logger)
     
     def _load_data(self, input_path: str) -> pd.DataFrame:
         dataframe = pd.read_parquet(input_path)
@@ -227,17 +225,6 @@ class DataPipeline:
         self.logger.info(f"[Finalization] Final dataset has {len(result_dataframe):,} rows and {len(result_dataframe.columns)} columns \n")
         return result_dataframe
     
-    def _save_data(self, dataframe: pd.DataFrame, output_path: str) -> None:
-        dataframe = dataframe.sort_values(self.config.columns.sort_cols)
-        dataframe.to_parquet(output_path, index=False)
-        
-        numeric_features = dataframe.select_dtypes(include=[np.number]).columns.tolist()
-        target_cols = [col for col in numeric_features if col.startswith('target_')]
-        feature_cols = [col for col in numeric_features if not col.startswith('target_')]
-        
-        self.logger.info(f"[Save] Final dataset: {len(dataframe):,} rows, {len(feature_cols)} features, {len(target_cols)} targets")
-        self.logger.info(f"[Save] Saved to {output_path} \n")
-
     def run(self, input_path: str, output_path: str) -> pd.DataFrame:
         self.logger.section("Feature Engineering Pipeline")
         
@@ -251,14 +238,7 @@ class DataPipeline:
         
         self.logger.subsection("Finalization")
         dataframe = self._finalize_data(dataframe)
-        self._save_data(dataframe, output_path)
         
         return dataframe
 
 
-if __name__ == "__main__":
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pipeline = DataPipeline(config)
-    raw_path = os.path.join(project_root, config.paths.raw_data)
-    train_path = os.path.join(project_root, config.paths.train_data)
-    pipeline.run(raw_path, train_path)

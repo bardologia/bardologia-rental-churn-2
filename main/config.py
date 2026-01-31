@@ -4,15 +4,10 @@ from typing import List, Optional
 
 @dataclass
 class PathsDetails:
+    data_dir             : str = "data"
     raw_data             : str = "data/raw_data.parquet"
     train_data           : str = "data/training_data.parquet"
     runs_dir             : str = "runs"
-    checkpoints_dir      : str = "checkpoints"
-    best_model_name      : str = "best_model.pth"
-    last_checkpoint_name : str = "last_checkpoint.pth"
-    best_model_ema_name  : str = "best_model_ema.pth"
-    optuna_tuning_dir    : str = "optuna_tuning"
-    optuna_results_dir   : str = "optuna_results"
     ablation_dir         : str = "ablation"
 
 
@@ -24,6 +19,7 @@ class SplitParams:
 
 @dataclass
 class LoadParams:
+    use_cache            : bool  = True
     sample_fraction      : float = 1.0
     load_sample_fraction : float = 0.01
     user_sample_count    : int   = 6
@@ -107,9 +103,9 @@ class EMAParams:
 
 @dataclass
 class OverfitParams:
-    overfit_single_batch     : bool  = True
-    overfit_epochs           : int   = 100
-    overfit_patience         : int   = 100
+    overfit_single_batch     : bool  = False
+    overfit_epochs           : int   = 1
+    overfit_patience         : int   = 1
     overfit_dropout          : float = 0.0
     overfit_weight_decay     : float = 0.0
     overfit_number_of_users  : int   = 3
@@ -131,21 +127,24 @@ class AblationParams:
     training_epochs: int = 10
     patience: int = 4
     scheduler_patience: int = 2
-    overfit_single_batch: bool = False
+    overfit_single_batch: bool = True
     metric: str = "rmse"
 
 
 @dataclass
 class Columns:
-    
-    drop_cols: List[str] = field(default_factory=lambda: [
-        'emissaoNotaFiscalData', 'emissaoNotaFiscalDia', 'codigoOSOmie', 'numeroNFSeOmie', 
-        'criacaoDataAcrescimoDesconto', 'adyenPspReferencePagamento' 
+    keep_cols: List[str] = field(default_factory=lambda: [
+        'usuarioId', 'locacaoId', 'ordem_parcela',
+        'criacaoData', 'vencimentoData', 'pagamentoData',
+        'Dias_atraso', 'categoria',
+        'valor_brl', 'valor_pago_brl', 'valor_caucao_brl',
+        'recorrencia_pagamento', 'sexo', 'faixa_idade_resumida',
+        'veiculo_modelo', 'pacoteNome', 'formaPagamento', 'lugar', 'regiao', 'produto_categoria',
+        'quantidadeDiarias', 'valor_caucao_entrada_brl', 'pacoteDuracao'
     ])
     
     date_cols: List[str] = field(default_factory=lambda: [
-        'vencimentoData', 'pagamentoData', 'pagamentoData_UTC', 'criacaoData', 
-        'competenciaInicioData', 'competenciaFimData', 'atualizacao_dt'
+        'vencimentoData', 'pagamentoData', 'criacaoData', 
     ])
     
     cat_cols: List[str] = field(default_factory=lambda: [

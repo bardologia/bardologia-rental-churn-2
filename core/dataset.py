@@ -1,12 +1,10 @@
 import pandas as pd
 import numpy as np
 import torch
-import logging
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
-from .logger import Logger
 
 
 class Augmentation:
@@ -94,7 +92,7 @@ class SequentialDataset(Dataset):
         continuous_data,
         targets,
         indices,
-        log_dir,
+        logger,
         augment=False,
         mask_last_cont=None,
         last_known_idx=None,
@@ -108,8 +106,7 @@ class SequentialDataset(Dataset):
         self.augment = (self.config.architecture.use_augmentation if (self.config is not None and self.config.architecture is not None) else False) and augment
         self.augment_probability = self.config.architecture.augment_prob if (self.config is not None and self.config.architecture is not None) else 0.0
         self.augmenter = Augmentation(self.config.augmentation) if (self.config is not None and self.config.augmentation is not None) else None
-        self.logger = Logger(name="SequentialDataset", level=logging.INFO, log_dir=log_dir)
-
+        self.logger = logger
         self.mask_last_cont = mask_last_cont or []
         self.last_known_idx = last_known_idx
 
@@ -163,78 +160,25 @@ class SequentialDataset(Dataset):
 class DatasetLoader:
     def __init__(
         self,
-        data_path,
         cfg,
-        log_dir
+        logger,
+        dataframe,
     ):
-        self.data_path = data_path
+        self.logger = logger
         self.config = cfg
-        self.log_dir = log_dir
-
-        self.logger = Logger(name="DatasetLoader", level=logging.INFO, log_dir=self.log_dir)
+        
+        self.dataframe = dataframe.copy()
 
         self.categorical_columns = list(self.config.columns.cat_cols)
-        self.continuous_columns = list(self.config.columns.cont_cols)
-        self.target_columns = list(self.config.columns.target_cols)
+        self.continuous_columns  = list(self.config.columns.cont_cols)
+        self.target_columns      = list(self.config.columns.target_cols)
 
-        self.continuous_scalers = {}
-        self.target_scalers = {}
+        self.continuous_scalers   = {}
+        self.target_scalers       = {}
         self.embedding_dimensions = []
 
 
-    def dataloader_pipeline(self):
-        self.logger.section("Dataloader Pipeline")
-        
-        self.logger.subsection("Data Loading")
-        dataframe = self._load_data()
-        
-        self.logger.subsection("Data Cleaning")
-        dataframe = self._clean_data(dataframe)
-        
-        self.logger.subsection("Target Clipping")
-        dataframe = self._clip_target(dataframe)
-
-        self.logger.subsection("Categorical Encoding")
-        dataframe = self._encode_categorical(dataframe)
-         
-        unique_users = dataframe[self.config.columns.group_cols[0]].unique()
-
-        self.logger.subsection("User Subsampling")
-        train_users, validation_users, test_users = self._split_users(unique_users)
-        
-        self.logger.subsection("Dataframe Splitting")
-        train_df, val_df, test_df = self._split_dataframes(dataframe, train_users, validation_users, test_users)
-        
-        self.logger.subsection("Feature Normalization")
-        train_df, val_df, test_df = self._normalize_continuous_features(train_df, val_df, test_df)
-        
-        self.logger.subsection("Target Normalization")
-        train_df, val_df, test_df = self._normalize_targets(train_df, val_df, test_df)
-        
-        self.logger.subsection("Index Creation")
-        indices, (train_df, val_df, test_df) = self._create_indices(train_df, val_df, test_df)
-        
-        self.logger.subsection("Array Creation")
-        continuous_array, categorical_array, targets_array  = self._create_arrays(train_df, val_df, test_df)
-        
-        self.logger.subsection("Dataset Creation")
-        train_dataset, val_dataset, test_dataset = self._create_datasets(
-            indices=indices,
-            continuous=continuous_array,
-            categorical=categorical_array,
-            targets=targets_array,
-        )
-
-        self.logger.subsection("Dataloader Creation")
-        train_dataloader, val_dataloader, test_dataloader = self.create_dataloaders(train_dataset, val_dataset, test_dataset)
-
-        self.logger.section("Dataloader Pipeline Complete")
-        return train_dataloader, val_dataloader, test_dataloader
-
-
-    def _load_data(self):
-        self.logger.info(f"[Data Loading] Loading sequential data from: {self.data_path}")
-        dataframe = pd.read_parquet(self.data_path)
+    def load_data(self, dataframe):
         self.logger.info(f"[Data Loading] Loaded {len(dataframe):,} rows, {len(dataframe.columns)} columns")
         
         group_col = self.config.columns.group_cols[0]
@@ -254,7 +198,7 @@ class DatasetLoader:
         return dataframe
 
 
-    def _clean_data(self, dataframe):
+    def clean_data(self, dataframe):
         payment_date = self.config.columns.due_date_col
         user_col = self.config.columns.user_id_col
         
@@ -275,7 +219,7 @@ class DatasetLoader:
         return dataframe
 
 
-    def _clip_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+    def clip_target(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         threshold = self.config.target.target_threshold
         num_clipped = (dataframe[self.target_columns] > threshold).sum().sum()
         dataframe[self.target_columns] = dataframe[self.target_columns].clip(upper=threshold)
@@ -283,7 +227,7 @@ class DatasetLoader:
         return dataframe
 
 
-    def _encode_categorical(self, dataframe):
+    def encode_categorical(self, dataframe):
         for column in self.categorical_columns:
             dataframe[column] = dataframe[column].astype(str)
 
@@ -301,7 +245,7 @@ class DatasetLoader:
         return dataframe
     
 
-    def _split_users(self, unique_users):
+    def split_users(self, unique_users):
         user_col       = self.config.columns.user_id_col
         user_dataframe = pd.DataFrame({user_col: unique_users})
         
@@ -329,7 +273,7 @@ class DatasetLoader:
         return train_users, validation_users, test_users
     
 
-    def _split_dataframes(self, dataframe, train_users, validation_users, test_users):
+    def split_dataframes(self, dataframe, train_users, validation_users, test_users):
         user_col  = self.config.columns.user_id_col
      
         train_dataframe      = dataframe[dataframe[user_col].isin(train_users)].copy()
@@ -358,7 +302,7 @@ class DatasetLoader:
         return train_dataframe, validation_dataframe, test_dataframe
     
 
-    def _normalize_continuous_features(self, train_dataframe, validation_dataframe, test_dataframe):
+    def normalize_continuous_features(self, train_dataframe, validation_dataframe, test_dataframe):
         no_scale = set(self.config.columns.no_scale_cols)
         for col in self.continuous_columns:
             if col in no_scale:
@@ -385,7 +329,7 @@ class DatasetLoader:
         return train_dataframe, validation_dataframe, test_dataframe
 
 
-    def _normalize_targets(self, train_dataframe, validation_dataframe, test_dataframe):
+    def normalize_targets(self, train_dataframe, validation_dataframe, test_dataframe):
         for target_col in self.target_columns:
             mean_before = train_dataframe[target_col].mean()
             std_before = train_dataframe[target_col].std()
@@ -415,7 +359,7 @@ class DatasetLoader:
         return train_dataframe, validation_dataframe, test_dataframe
         
 
-    def _create_expanding_indices(self, dataframe, group_column):
+    def create_expanding_indices(self, dataframe, group_column):
         indices = []
         dataframe_reset = dataframe.reset_index(drop=True)
         group_offsets = dataframe_reset.groupby(group_column).indices
@@ -467,7 +411,7 @@ class DatasetLoader:
         return indices
 
 
-    def _create_indices(self, train_dataframe, validation_dataframe, test_dataframe):
+    def create_indices(self, train_dataframe, validation_dataframe, test_dataframe):
         group_cols = self.config.columns.group_cols
         sort_cols  = self.config.columns.sort_cols
     
@@ -475,22 +419,22 @@ class DatasetLoader:
         validation_dataframe = validation_dataframe.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
         test_dataframe       = test_dataframe.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     
-        train_indices      = self._create_expanding_indices(train_dataframe, group_cols)
-        validation_indices = self._create_expanding_indices(validation_dataframe, group_cols)
-        test_indices       = self._create_expanding_indices(test_dataframe, group_cols)
+        train_indices      = self.create_expanding_indices(train_dataframe, group_cols)
+        validation_indices = self.create_expanding_indices(validation_dataframe, group_cols)
+        test_indices       = self.create_expanding_indices(test_dataframe, group_cols)
     
         self.logger.info(f"[Indices] Created {len(train_indices):,} training sequences")
         self.logger.info(f"[Indices] Created {len(validation_indices):,} validation sequences")    
         self.logger.info(f"[Indices] Created {len(test_indices):,} test sequences \n")
 
-        sequence_lengths_train = [end - start for (start, end, _) in train_indices]
+        sequence_lengths_train      = [end - start for (start, end, _) in train_indices]
         sequence_lengths_validation = [end - start for (start, end, _) in validation_indices]
-        sequence_lengths_test = [end - start for (start, end, _) in test_indices]
+        sequence_lengths_test       = [end - start for (start, end, _) in test_indices]
 
         avg_length_train, avg_length_val, avg_length_test = np.mean(sequence_lengths_train), np.mean(sequence_lengths_validation), np.mean(sequence_lengths_test)
-        std_length_train, std_length_val, std_length_test = np.std(sequence_lengths_train), np.std(sequence_lengths_validation), np.std(sequence_lengths_test)
-        min_length_train, min_length_val, min_length_test = np.min(sequence_lengths_train), np.min(sequence_lengths_validation), np.min(sequence_lengths_test)
-        max_length_train, max_length_val, max_length_test = np.max(sequence_lengths_train), np.max(sequence_lengths_validation), np.max(sequence_lengths_test)
+        std_length_train, std_length_val, std_length_test = np.std(sequence_lengths_train),  np.std(sequence_lengths_validation),  np.std(sequence_lengths_test)
+        min_length_train, min_length_val, min_length_test = np.min(sequence_lengths_train),  np.min(sequence_lengths_validation),  np.min(sequence_lengths_test)
+        max_length_train, max_length_val, max_length_test = np.max(sequence_lengths_train),  np.max(sequence_lengths_validation),  np.max(sequence_lengths_test)
         
         self.logger.info(f"[Indices] Training sequence lengths: mean={avg_length_train:.2f}, std={std_length_train:.2f} timesteps")
         self.logger.info(f"[Indices] Training sequence lengths: min={min_length_train} timesteps, max={max_length_train} timesteps \n")
@@ -504,7 +448,7 @@ class DatasetLoader:
         return (train_indices, validation_indices, test_indices), (train_dataframe, validation_dataframe, test_dataframe)
 
 
-    def _create_arrays(self, train_dataframe, validation_dataframe, test_dataframe):   
+    def create_arrays(self, train_dataframe, validation_dataframe, test_dataframe):   
         train_continuous       = train_dataframe[self.continuous_columns].values
         validation_continuous  = validation_dataframe[self.continuous_columns].values
         test_continuous        = test_dataframe[self.continuous_columns].values
@@ -538,7 +482,7 @@ class DatasetLoader:
         return continuous_array, categorical_array, targets_array
 
 
-    def _create_datasets(self, indices, continuous, categorical, targets):
+    def create_datasets(self, indices, continuous, categorical, targets):
         mask_idxs = []
         known_idx = None
        
@@ -559,7 +503,7 @@ class DatasetLoader:
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
             cfg=self.config,
-            log_dir = self.log_dir 
+            logger = self.logger
         )
         
         validation_dataset = SequentialDataset(
@@ -571,7 +515,7 @@ class DatasetLoader:
             mask_last_cont =mask_idxs,
             last_known_idx =known_idx,
             cfg =self.config,
-            log_dir = self.log_dir 
+            logger = self.logger
         )
         
         test_dataset = SequentialDataset(
@@ -583,7 +527,7 @@ class DatasetLoader:
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
             cfg=self.config,
-            log_dir = self.log_dir 
+            logger = self.logger
         )
     
         self.logger.info(f"[Datasets] Created training dataset with {len(train_dataset):,} samples")
@@ -642,4 +586,53 @@ class DatasetLoader:
         self.logger.info(f"[Dataloaders] Created test dataloader with {len(test_dataloader):,} batches \n")
         return train_dataloader, validation_dataloader, test_dataloader
     
+
+    def run(self):
+        self.logger.section("Dataloader Pipeline")
+         
+        self.logger.subsection("Data Loading")
+        dataframe = self.load_data(self.dataframe)
+        
+        self.logger.subsection("Data Cleaning")
+        dataframe = self.clean_data(dataframe)
+        
+        self.logger.subsection("Target Clipping")
+        dataframe = self.clip_target(dataframe)
+
+        self.logger.subsection("Categorical Encoding")
+        dataframe = self.encode_categorical(dataframe)
+         
+        unique_users = dataframe[self.config.columns.group_cols[0]].unique()
+
+        self.logger.subsection("User Subsampling")
+        train_users, validation_users, test_users = self.split_users(unique_users)
+        
+        self.logger.subsection("Dataframe Splitting")
+        train_df, val_df, test_df = self.split_dataframes(dataframe, train_users, validation_users, test_users)
+        
+        self.logger.subsection("Feature Normalization")
+        train_df, val_df, test_df = self.normalize_continuous_features(train_df, val_df, test_df)
+        
+        self.logger.subsection("Target Normalization")
+        train_df, val_df, test_df = self.normalize_targets(train_df, val_df, test_df)
+        
+        self.logger.subsection("Index Creation")
+        indices, (train_df, val_df, test_df) = self.create_indices(train_df, val_df, test_df)
+        
+        self.logger.subsection("Array Creation")
+        continuous_array, categorical_array, targets_array  = self.create_arrays(train_df, val_df, test_df)
+        
+        self.logger.subsection("Dataset Creation")
+        train_dataset, val_dataset, test_dataset = self.create_datasets(
+            indices=indices,
+            continuous=continuous_array,
+            categorical=categorical_array,
+            targets=targets_array,
+        )
+
+        self.logger.subsection("Dataloader Creation")
+        train_dataloader, val_dataloader, test_dataloader = self.create_dataloaders(train_dataset, val_dataset, test_dataset)
+
+        self.logger.section("Dataloader Pipeline Complete")
+        return train_dataloader, val_dataloader, test_dataloader
  

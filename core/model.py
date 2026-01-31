@@ -355,17 +355,22 @@ class Model(nn.Module):
         self,
         embedding_dimensions: list,
         num_continuous: int,
-        cfg=None,
+        target_scaler = None,
+        feature_scaler = None,
+        config=None,
     ):
         super().__init__()
-        self.config = cfg
-
+        self.config = config
+        self.embedding_dimensions = embedding_dimensions
+        self.target_scaler = target_scaler
+        self.feature_scaler = feature_scaler
+        
         self.hidden_dimension = self.config.architecture.hidden_dim
-        self.num_categorical = len(embedding_dimensions)
+        self.num_categorical = len(self.embedding_dimensions)
         self.num_continuous = num_continuous
 
         self.tokenizer = FeatureTokenizer(
-            embedding_dimensions,
+            self.embedding_dimensions,
             num_continuous,
             self.hidden_dimension,
             periodic_sigma=self.config.architecture.periodic_sigma,
@@ -402,15 +407,19 @@ class Model(nn.Module):
     ) -> torch.Tensor:
         
         batch_size, sequence_length, _ = categorical_sequence.shape
-        tokens = self.tokenizer(categorical_sequence, continuous_sequence)
+        batch_indices                  = torch.arange(batch_size, device=categorical_sequence.device)
+        last_indices                   = (lengths - 1).long().clamp(min=0)
+        mask                           = torch.arange(sequence_length, device=categorical_sequence.device).expand(batch_size, sequence_length) >= lengths.unsqueeze(1)
+
+        tokens                  = self.tokenizer(categorical_sequence, continuous_sequence)
         invoice_representations = self.invoice_encoder(tokens)
-        context, all_hidden = self.sequence_encoder(invoice_representations, lengths)
-        batch_indices = torch.arange(batch_size, device=categorical_sequence.device)
-        last_indices = (lengths - 1).long().clamp(min=0)
-        current_representation = invoice_representations[batch_indices, last_indices]
-        mask = torch.arange(sequence_length, device=categorical_sequence.device).expand(batch_size, sequence_length) >= lengths.unsqueeze(1)
-        attended, _ = self.temporal_attention(current_representation, all_hidden, mask=mask)
+        
+        context, all_hidden     = self.sequence_encoder(invoice_representations, lengths)
+        current_representation  = invoice_representations[batch_indices, last_indices]
+        attended, _             = self.temporal_attention(current_representation, all_hidden, mask=mask)
+        
         combined = torch.cat([current_representation, context, attended], dim=-1)
         output = self.head_days(combined)
+        
         return output.squeeze(-1)
     

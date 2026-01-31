@@ -1,5 +1,4 @@
 import torch
-import logging
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -7,78 +6,9 @@ from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import mean_absolute_percentage_error, median_absolute_error
 import numpy as np
-import os
+import itertools
 import copy
-from main.config import config as _global_config
-from dataclasses import asdict
-from core.logger import Logger
 from tqdm.auto import tqdm
-
-
-class EMA:
-    def __init__(self, model, cfg=None, decay=None, step_threshold=None):
-        cfg = cfg or _global_config
-        self.model = model
-        self.decay = decay if decay is not None else cfg.ema.decay
-        self.step_threshold = step_threshold if step_threshold is not None else cfg.ema.step_threshold
-        self.shadow = {name: param.clone().detach() for name, param in model.named_parameters()}
-        self.backup = {}
-        self.num_updates = 0
-
-    def update(self):
-        self.num_updates += 1
-        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - d) * param.data + d * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
-    
-    @torch.no_grad()
-    def update(self):
-        decay = self._get_decay()
-        self.step += 1
-
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-    def apply_shadow(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-    def state_dict(self):
-        return {
-            'shadow': self.shadow,
-            'step': self.step,
-            'decay': self.decay
-        }
-
-    def load_state_dict(self, state_dict):
-        self.shadow = state_dict['shadow']
-        self.step = state_dict['step']
-        self.decay = state_dict.get('decay', self.decay)
 
 
 class Trainer: 
@@ -87,50 +17,25 @@ class Trainer:
         model,
         train_loader,
         validation_loader,
-        checkpoint_dir="checkpoints",
         target_scaler=None,
-        feature_scaler=None,
-        embedding_dimensions=None,
-        log_dir=None,
-        cfg=None,
+        logger = None,
+        config=None,
     ):
-        self.config = cfg or _global_config
+        self.logger = logger
+        self.config = config 
 
-        if self.config.training.device is None:
-            self.config.training.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.device = torch.device(self.config.training.device)
-        self.logger = Logger(name="Trainer", level=logging.INFO, log_dir=log_dir, config=self.config)
-
-        self.logger.save_config_file(cfg=self.config)
-
-        self.logger.section("Trainer Initialization")
-        self.logger.info(f"[Device] Using: {self.device}")
-        try:
-            self.logger.info(f"[GPU] Name: {torch.cuda.get_device_name(0)}")
-            self.logger.info(f"[GPU] Memory Total: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-            self.logger.info(f"[GPU] CUDA Version: {torch.version.cuda} \n")
-        except Exception:
-            self.logger.info("[GPU] CUDA not available or query failed.\n")
-
-        self._log_parameters(model)
-
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
 
-        self.train_loader = train_loader
+        self.train_loader      = train_loader
         self.validation_loader = validation_loader
-        self.target_scaler = target_scaler
-        self.feature_scaler = feature_scaler
-        self.embedding_dimensions = embedding_dimensions or []
+        self.target_scaler     = target_scaler
+    
         self.high_target_weight = self.config.training.high_target_weight
-        self.logger.info(f"[High Target Weight] Using high target weight: {self.high_target_weight}\n")
-
-        self.checkpoint_dir = checkpoint_dir
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-
+  
         self.criterion = nn.SmoothL1Loss(reduction='none')
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.training.lr, weight_decay=self.config.training.weight_decay)
-        self.scaler = GradScaler() if self.config.training.mixed_precision else None
+        self.scaler    = GradScaler() if self.config.training.mixed_precision else None
 
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
@@ -138,41 +43,34 @@ class Trainer:
             factor=self.config.scheduler.scheduler_factor,
             patience=self.config.scheduler.scheduler_patience,
         )
+        
         self.global_step = 0
+        self.checkpoint = None
 
-        self.ema = None
-        if self.config.ema.use_ema:
-            self.ema = EMA(self.model, cfg=self.config)
-          
-    def _log_parameters(self, model):
+        self.logger.section("Trainer Initialization")
+        self.logger.info(f"[High Target Weight] Using high target weight: {self.high_target_weight}\n")
+        self.log_parameters(model)
+
+    def log_parameters(self, model):
         self.logger.section("[Model Parameter Counts]")
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.subsection(f"Full Model - Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
-        total_params = sum(p.numel() for p in model.tokenizer.parameters())
-        trainable_params = sum(p.numel() for p in model.tokenizer.parameters() if p.requires_grad)
-        self.logger.info(f"[Tokenizer] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
-        total_params = sum(p.numel() for p in model.invoice_encoder.parameters())
-        trainable_params = sum(p.numel() for p in model.invoice_encoder.parameters() if p.requires_grad)
-        self.logger.info(f"[Invoice Encoder] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
-        total_params = sum(p.numel() for p in model.sequence_encoder.parameters())
-        trainable_params = sum(p.numel() for p in model.sequence_encoder.parameters() if p.requires_grad)
-        self.logger.info(f"[Sequence Encoder] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
-        total_params = sum(p.numel() for p in model.temporal_attention.parameters())
-        trainable_params = sum(p.numel() for p in model.temporal_attention.parameters() if p.requires_grad)
-        self.logger.info(f"[Temporal Attention] - Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
-        total_params = sum(p.numel() for p in model.head_days.parameters())
-        trainable_params = sum(p.numel() for p in model.head_days.parameters() if p.requires_grad)
-        self.logger.info(f"[Prediction Head] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
-        
+
+        children = []
+        for name, module in model.named_children():
+            total = sum(p.numel() for p in module.parameters())
+            trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            children.append((name, total, trainable))
+
+        children.sort(key=lambda x: x[1], reverse=True)
+
+        for name, total, trainable in children:
+            self.logger.info(f"[{name}] Total parameters: {total:,}, Trainable: {trainable:,}")
+
         self.logger.info("")
 
-    def _weighted_loss(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def weighted_loss(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         losses = self.criterion(preds, targets).view(-1)
 
         if self.high_target_weight and self.target_scaler is not None and self.high_target_weight > 0:
@@ -184,39 +82,8 @@ class Trainer:
             return weighted.mean()
 
         return losses.mean()
-          
-    def save_checkpoint(self, epoch, metric, is_best=False):
-        state = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'global_step': self.global_step,
-            'best_metric': metric,
-            'ema_state_dict': self.ema.state_dict() if self.ema else None,
-            'target_scaler': self.target_scaler,
-            'feature_scaler': self.feature_scaler,
-            'embedding_dimensions': list(self.embedding_dimensions) if self.embedding_dimensions is not None else [],
-            'configs': asdict(self.config),
-        }
-        
-        last_path = os.path.join(self.checkpoint_dir, self.config.paths.last_checkpoint_name)
-        torch.save(state, last_path)
-        
-        if is_best:
-            best_path = os.path.join(self.checkpoint_dir, self.config.paths.best_model_name)
-            torch.save(state, best_path)
-            
-            if self.ema:
-                ema_path = os.path.join(self.checkpoint_dir, self.config.paths.best_model_ema_name)
-                self.ema.apply_shadow()
-                torch.save(self.model.state_dict(), ema_path)
-                self.ema.restore()
-            
-            if self.logger:
-                self.logger.info(f"[Checkpoint] New best model saved")
-    
-    def _backward_step(self, loss):
+              
+    def backward(self, loss):
         if self.scaler:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -230,164 +97,100 @@ class Trainer:
 
         self.global_step += 1
 
-        if self.ema:
-            self.ema.update()
-    
     def train_epoch(self, epoch=None):
         self.model.train()
         running_loss = torch.tensor(0.0, device=self.device)
         num_batches = 0
-        
+   
         if self.config.overfit.overfit_single_batch:
             single_batch = next(iter(self.train_loader))
-            loop = tqdm(range(len(self.train_loader)), desc=f"Train Epoch {epoch} (Overfit Single Batch)")
-            for _ in loop:
-                categorical_features, continuous_features, targets, lengths = single_batch
-                
-                categorical_features = categorical_features.to(self.device, non_blocking=True)
-                continuous_features = continuous_features.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-                lengths = lengths.to(self.device, non_blocking=True)
-                
-                self.optimizer.zero_grad(set_to_none=True)
-                
-                with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
-                    preds = self.model(categorical_features, continuous_features, lengths)
-                    target_tensor = targets.view(-1)
-                    loss = self._weighted_loss(preds, target_tensor)
-                
-                self._backward_step(loss)
-                running_loss += loss.detach()
-                num_batches += 1
+            batch_iterable = itertools.repeat(single_batch, len(self.train_loader))
+            loop = tqdm(batch_iterable, desc=f"Train Epoch {epoch} (Overfit Single Batch)", total=len(self.train_loader))
         else:
             loop = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
-            
-            for batch_index, (categorical_features, continuous_features, targets, lengths) in enumerate(loop):
-                
-                categorical_features = categorical_features.to(self.device, non_blocking=True)
-                continuous_features = continuous_features.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-                lengths = lengths.to(self.device, non_blocking=True)
-                
-                self.optimizer.zero_grad(set_to_none=True)
-                
-                with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
-                    preds = self.model(categorical_features, continuous_features, lengths)
-                    target_tensor = targets.view(-1)
-                    loss = self._weighted_loss(preds, target_tensor)
-                
-                self._backward_step(loss)
-                running_loss += loss.detach()
-                num_batches += 1
+
+        for batch in loop:
+            categorical_features, continuous_features, targets, lengths = batch
+
+            categorical_features = categorical_features.to(self.device, non_blocking=True)
+            continuous_features  = continuous_features.to(self.device, non_blocking=True)
+            targets              = targets.to(self.device, non_blocking=True)
+            lengths              = lengths.to(self.device, non_blocking=True)
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
+                preds         = self.model(categorical_features, continuous_features, lengths)
+                target_tensor = targets.view(-1)
+                loss          = self.weighted_loss(preds, target_tensor)
+
+            self.backward(loss)
+            running_loss += loss.detach()
+            num_batches += 1
         
         average_loss = (running_loss / max(num_batches, 1)).item()    
         return average_loss
     
-    def _metrics(self, den_targets, den_preds, average_loss):
-        den_targets = np.asarray(den_targets).reshape(-1)
-        den_preds = np.asarray(den_preds).reshape(-1)
+    def compute_metrics(self, den_targets, den_preds, average_loss=None) -> dict:
+        den_preds   = np.asarray(den_preds).flatten()
+        den_targets = np.asarray(den_targets).flatten()
 
-        diff = np.abs(den_preds - den_targets)
-        total = den_targets.size
+        mae = float(np.mean(np.abs(den_preds - den_targets)))
+        rmse = float(np.sqrt(np.mean((den_preds - den_targets) ** 2)))
+        ss_res = float(np.sum((den_targets - den_preds) ** 2))
+        ss_tot = float(np.sum((den_targets - np.mean(den_targets)) ** 2))
+        r2 = float(1 - ss_res / ss_tot) if ss_tot != 0 else float('nan')
+        std = float(np.std(den_targets - den_preds))
+        medae = float(median_absolute_error(den_targets, den_preds))
+        max_error = float(np.max(np.abs(den_targets - den_preds)))
+        p50 = np.percentile(np.abs(den_targets - den_preds), 50)
+        p90 = np.percentile(np.abs(den_targets - den_preds), 90)
+        p95 = np.percentile(np.abs(den_targets - den_preds), 95)
 
-        if total == 0:
-            nan = float('nan')
-            metrics = {
-                'loss': average_loss,
-                'mae': nan,
-                'rmse': nan,
-                'r2': nan,
-                'std_error': nan,
-                'p50': nan,
-                'p90': nan,
-                'p99': nan,
-                'mape': nan,
-                'medae': nan,
-                'max_error': nan,
-                'error_bin_0_5': 0.0,
-                'error_bin_5_10': 0.0,
-                'error_bin_10_15': 0.0,
-                'error_bin_15_20': 0.0,
-                'error_bin_20_25': 0.0,
-                'error_bin_above_25': 0.0,
-                'error_target_0_5': nan,
-                'error_target_5_10': nan,
-                'error_target_10_15': nan,
-                'error_target_15_20': nan,
-                'error_target_20_25': nan,
-                'error_target_above_25': nan
-            }
+        abs_err = np.abs(den_targets - den_preds)
+        error_bin_0_5 = float(np.mean(abs_err <= 5) * 100)
+        error_bin_5_10 = float(np.mean((abs_err > 5) & (abs_err <= 10)) * 100)
+        error_bin_10_15 = float(np.mean((abs_err > 10) & (abs_err <= 15)) * 100)
+        error_bin_15_20 = float(np.mean((abs_err > 15) & (abs_err <= 20)) * 100)
+        error_bin_20_25 = float(np.mean((abs_err > 20) & (abs_err <= 25)) * 100)
+        error_bin_above_25 = float(np.mean(abs_err > 25) * 100)
 
-            return metrics
-
-        mae = np.nanmean(diff)
-        rmse = np.sqrt(np.nanmean((den_preds - den_targets) ** 2))
-        ss_res = np.nansum((den_targets - den_preds) ** 2)
-        ss_tot = np.nansum((den_targets - np.nanmean(den_targets)) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot != 0 else float('nan')
-        p50 = np.percentile(diff, 50) if diff.size > 0 else float('nan')
-        p90 = np.percentile(diff, 90) if diff.size > 0 else float('nan')
-        p99 = np.percentile(diff, 99) if diff.size > 0 else float('nan')
-
-        std_error = np.nanstd(den_preds - den_targets)
-        mape = mean_absolute_percentage_error(den_targets, den_preds) if diff.size > 0 else float('nan')
-        medae = median_absolute_error(den_targets, den_preds) if diff.size > 0 else float('nan')
-        max_error = np.nanmax(diff) if diff.size > 0 else float('nan')
-
-        error_bin_0_5      = np.mean(diff <= 5) * 100 if total > 0 else 0.0
-        error_bin_5_10     = np.mean((diff > 5) & (diff <= 10)) * 100 if total > 0 else 0.0
-        error_bin_10_15    = np.mean((diff > 10) & (diff <= 15)) * 100 if total > 0 else 0.0
-        error_bin_15_20    = np.mean((diff > 15) & (diff <= 20)) * 100 if total > 0 else 0.0
-        error_bin_20_25    = np.mean((diff > 20) & (diff <= 25)) * 100 if total > 0 else 0.0
-        error_bin_above_25 = np.mean(diff > 25) * 100 if total > 0 else 0.0
-
-        t = den_targets.flatten()
-        err = np.abs(den_targets - den_preds)
-        def _subset_mean(mask):
-            s = err[mask]
-            return np.nanmean(s) if s.size > 0 else float('nan')
-
-        error_target_0_5 = _subset_mean(t <= 5)
-        error_target_5_10 = _subset_mean((t > 5) & (t <= 10))
-        error_target_10_15 = _subset_mean((t > 10) & (t <= 15))
-        error_target_15_20 = _subset_mean((t > 15) & (t <= 20))
-        error_target_20_25 = _subset_mean((t > 20) & (t <= 25))
-        error_target_above_25 = _subset_mean(t > 25)
+        def mean_target_range(low, high=None):
+            mask = (den_targets > low) & (den_targets <= high)
+            vals = abs_err[mask]
+            return float(np.mean(vals)) if len(vals) > 0 else float('nan')
 
         metrics = {
-            'loss': average_loss,
             'mae': mae,
             'rmse': rmse,
             'r2': r2,
-            'std_error': std_error,
+            'std': std,
             'p50': p50,
             'p90': p90,
-            'p99': p99,
-            'mape': mape,
+            'p95': p95,
             'medae': medae,
             'max_error': max_error,
-            'error_bin_0_5': error_bin_0_5,
-            'error_bin_5_10': error_bin_5_10,
-            'error_bin_10_15': error_bin_10_15,
-            'error_bin_15_20': error_bin_15_20,
-            'error_bin_20_25': error_bin_20_25,
-            'error_bin_above_25': error_bin_above_25,
-            'error_target_0_5': error_target_0_5,
-            'error_target_5_10': error_target_5_10,
-            'error_target_10_15': error_target_10_15,
-            'error_target_15_20': error_target_15_20,
-            'error_target_20_25': error_target_20_25,
-            'error_target_above_25': error_target_above_25
+            'loss': average_loss,
+            
+            '0_5': error_bin_0_5,
+            '5_10': error_bin_5_10,
+            '10_15': error_bin_10_15,
+            '15_20': error_bin_15_20,
+            '20_25': error_bin_20_25,
+            'above_25': error_bin_above_25,
+    
+            '0_5': mean_target_range(0, 5),
+            '5_10': mean_target_range(5, 10),
+            '10_15': mean_target_range(10, 15),
+            '15_20': mean_target_range(15, 20),
+            '20_25': mean_target_range(20, 25),
+            'above_25': mean_target_range(25, 30),
         }
-
+        
         return metrics
 
     @torch.no_grad()
-    def evaluate(self, loader, use_ema=True):
-        self.model.eval()
-        if use_ema and self.ema:
-            self.ema.apply_shadow()
-        
+    def evaluate(self, loader):
         all_preds = []
         all_targets = []
         running_loss = torch.tensor(0.0, device=self.device)
@@ -395,22 +198,19 @@ class Trainer:
         num_batches = 0
         for categorical_features, continuous_features, targets, lengths in loader:
             categorical_features = categorical_features.to(self.device, non_blocking=True)
-            continuous_features = continuous_features.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            lengths = lengths.to(self.device, non_blocking=True)
+            continuous_features  = continuous_features.to(self.device, non_blocking=True)
+            targets              = targets.to(self.device, non_blocking=True)
+            lengths              = lengths.to(self.device, non_blocking=True)
             
-            preds = self.model(categorical_features, continuous_features, lengths)
+            preds         = self.model(categorical_features, continuous_features, lengths)
             target_tensor = targets.view(-1)
-            loss = self.criterion(preds, target_tensor).mean()
+            loss          = self.criterion(preds, target_tensor).mean()
             running_loss += loss.detach()
             
             num_batches += 1
             all_preds.append(preds.cpu())
             all_targets.append(target_tensor.cpu())
-        
-        if use_ema and self.ema:
-            self.ema.restore()
-        
+             
         average_loss = (running_loss / max(num_batches, 1)).item()
 
         all_preds_tensor = torch.cat(all_preds, dim=0).numpy()
@@ -422,7 +222,7 @@ class Trainer:
         den_preds   = np.clip(den_preds, 0, None)
         den_targets = np.clip(den_targets, 0, None)
 
-        metrics = self._metrics(den_targets, den_preds, average_loss)
+        metrics = self.compute_metrics(den_targets, den_preds, average_loss)
         
         return metrics
     
@@ -434,23 +234,28 @@ class Trainer:
         
         best_rmse = float('inf')
         best_model_state = None
-        best_ema_state = None
         
         patience_counter = 0
         for epoch in range(1, self.config.training.epochs + 1):
-            train_loss = self.train_epoch(epoch=epoch)
-            validation_metrics = self.evaluate(self.validation_loader, use_ema=True)
-            validation_rmse = validation_metrics['rmse']
+            train_loss         = self.train_epoch(epoch=epoch)
+            validation_metrics = self.evaluate(self.validation_loader)
+            validation_rmse    = validation_metrics['rmse']
             
             self.scheduler.step(validation_rmse)
             
-            self.logger.info(f"Epoch {epoch}: Train Loss={train_loss:.4f} | Val Loss={validation_metrics['loss']:.4f} | MAE={validation_metrics['mae']:.4f} | RMSE={validation_rmse:.4f} | R2={validation_metrics['r2']:.4f} | StdErr={validation_metrics['std_error']:.4f}")
+            self.logger.info(
+                f"Epoch {epoch}:\n"
+                f"  Train Loss = {train_loss:.4f}\n"
+                f"  Val   Loss = {validation_metrics['loss']:.4f}\n"
+                f"  MAE        = {validation_metrics['mae']:.4f} | RMSE = {validation_rmse:.4f}\n"
+                f"  R2         = {validation_metrics['r2']:.4f} | StdErr = {validation_metrics['std']:.4f}\n"
+                f"  P50 = {validation_metrics['p50']:.4f} | P90 = {validation_metrics['p90']:.4f} | P95 = {validation_metrics['p95']:.4f} \n"
+            )
+            
             if validation_rmse < best_rmse:
                 best_rmse = validation_rmse
                 best_model_state = copy.deepcopy(self.model.state_dict())
-                best_ema_state = copy.deepcopy(self.ema.state_dict()) if self.ema else None
                 patience_counter = 0
-                self.save_checkpoint(epoch, validation_rmse, is_best=True)
                 self.logger.info(f" New Best Model: RMSE={validation_rmse:.4f}")
             else:
                 patience_counter += 1
@@ -460,15 +265,6 @@ class Trainer:
         
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
-            if best_ema_state is not None:
-                self.ema.load_state_dict(best_ema_state)
-        
-        self.logger.log_experiment_summary(
-            best_metrics={
-                "Best RMSE": best_rmse,
-            },
-            notes=f"Training completed com sucesso. Checkpoints salvos em {self.checkpoint_dir}"
-        )
-        
+           
         return self.model
     

@@ -1,159 +1,125 @@
 import os
-
 from tqdm import tqdm
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-from datetime import datetime
-from typing import Dict, Optional, Any
 
 import pandas as pd
-import torch
+import copy
 
-from main.config import config
 from core.dataset import DatasetLoader
 from core.trainer import Trainer
 from core.model import Model  
+from core.results import Results
 
 
 class FeatureAblation:
     def __init__(
         self,
-        data_path: str,
-        output_dir: str = None,
-        metric: str = "rmse",
+        dataframe,
+        config = None,
+        logger = None
     ):
-        self.data_path = data_path
-        # default to config path for ablation outputs when not provided
-        self.output_dir = output_dir or config.paths.ablation_dir
-        self.metric = metric
-
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        self._original_categorical_columns = list(config.columns.cat_cols)
-        self._original_continuous_columns = list(config.columns.cont_cols)
-        self._original_user_sample_num = config.load.user_sample_count
-
-        self.protected = ["target_days_to_payment", "delay_clipped", "delay_is_known"]
+        self.logger = logger
+        
+        self.original_dataframe           = dataframe.copy()
+        self.original_config              = config
+        self.original_categorical_columns = list(config.columns.cat_cols)
+        self.original_continuous_columns  = list(config.columns.cont_cols)
+    
+        self.protected = ["target_days_to_payment", "delay_is_known", "delay_clipped"]
  
-    def run(self) -> pd.DataFrame:
-        try:
-            config.columns.cat_cols = list(self._original_categorical_columns)
-            config.columns.cont_cols = list(self._original_continuous_columns)
-            baseline_val_metrics, baseline_test_metrics, baseline_num_params, baseline_run_dir = self._train(tag="baseline")
+    def remove_feature(self, feat: str, dataframe: pd.DataFrame = None, config = None):
 
-            baseline_metric = float(baseline_val_metrics[self.metric])
-          
+        if dataframe is None or config is None:
+            return None, "invalid_input", config
 
-            rows = [self._row("__baseline__", "baseline", False, baseline_val_metrics, baseline_test_metrics, baseline_num_params, baseline_run_dir, baseline_metric, None, self.metric)]
-            features = self._original_categorical_columns + self._original_continuous_columns
-           
-            for feature in tqdm(features, desc="Ablating features", ncols=100):
-                config.columns.cat_cols  = list(self._original_categorical_columns)
-                config.columns.cont_cols = list(self._original_continuous_columns)
-                removed, feature_type    = self._remove_feature(feature)
+        working_dataframe = dataframe.copy()
+        working_cfg       = copy.deepcopy(config)
 
-                if not removed:
-                    rows.append(self._row(feature, feature_type, False, baseline_val_metrics, baseline_test_metrics, baseline_num_params, baseline_run_dir, baseline_metric, None, self.metric))
-                    continue
-
-                val_metrics, test_metrics, num_params, run_dir = self._train(tag=f"minus_{feature}")
-              
-                delta = float(val_metrics[self.metric]) - baseline_metric
-                rows.append(self._row(feature, feature_type, True, val_metrics, test_metrics, num_params, run_dir, baseline_metric, delta, self.metric))
-
-            df = pd.DataFrame(rows).sort_values("delta_metric", ascending=False, na_position="last").reset_index(drop=True)
-            out_csv = os.path.join(self.output_dir, f"ablation_{self.metric}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-            df.to_csv(out_csv, index=False)
-            return df
-
-        finally:
-            config.columns.cat_cols = list(self._original_categorical_columns)
-            config.columns.cont_cols = list(self._original_continuous_columns)
-            config.load.user_sample_count = self._original_user_sample_num
-
-    def _remove_feature(self, feat: str):
         if feat in self.protected:
-            return False, "protected"
+            return working_dataframe, "protected", working_cfg
 
-        cat = list(config.columns.cat_cols)
-        cont = list(config.columns.cont_cols)
+        cat  = list(working_cfg.columns.cat_cols)
+        cont = list(working_cfg.columns.cont_cols)
 
         if feat in cat:
+            working_dataframe = working_dataframe.drop(columns=[feat])
             cat.remove(feat)
-            config.columns.cat_cols = cat
-            return True, "categorical"
+            working_cfg.columns.cat_cols = cat
+            return working_dataframe, "categorical", working_cfg
 
         if feat in cont:
+            working_dataframe = working_dataframe.drop(columns=[feat])
             cont.remove(feat)
-            config.columns.cont_cols = cont
-            return True, "continuous"
+            working_cfg.columns.cont_cols = cont
+            return working_dataframe, "continuous", working_cfg
 
-        return False, "not_found"
-
-    def _train(self, tag: str):
-        run_dir = os.path.join(self.output_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}__{tag}")
-        ckpt_dir = os.path.join(run_dir, config.paths.checkpoints_dir)
-        os.makedirs(ckpt_dir, exist_ok=True)
-        torch.cuda.empty_cache()
-
-        data = DatasetLoader(self.data_path, cfg=config, log_dir=run_dir)
-        train_loader, val_loader, test_loader = data.dataloader_pipeline()
+        return None, "not_found", config
+    
+    def train(self, dataset_loader, config):
+        train_loader, validation_loader, _ = dataset_loader.run()
+        target_scaler       = dataset_loader.target_scalers[config.columns.target_col_name]
+        continuous_scalers  = dataset_loader.continuous_scalers 
 
         model = Model(
-            data.embedding_dimensions,
-            len(data.continuous_columns),
-            cfg=config,
-        )
-
-        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            embedding_dimensions = dataset_loader.embedding_dimensions,             
+            num_continuous = len(dataset_loader.continuous_columns), 
+            target_scaler = target_scaler,
+            feature_scaler = continuous_scalers,
+            config = config
+        )    
 
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
-            validation_loader=val_loader,
-            checkpoint_dir=ckpt_dir,
-            target_scaler=data.target_scalers[config.columns.target_col_name],
-            feature_scaler=data.continuous_scalers,
-            embedding_dimensions=data.embedding_dimensions,
-            log_dir=run_dir,
+            validation_loader=validation_loader,
+            target_scaler=target_scaler,
+            logger = self.logger,
+            config=config
+        )
+        
+        trained_model = trainer.fit()
+
+        evaluator = Results(
+            model=trained_model,
+            device=trainer.device
         )
 
-        trainer.fit()
+        val_results   = evaluator.run(validation_loader)
+        val_metrics   = val_results['metrics']
+   
+        return val_metrics
+
+    def run(self, metric):
+        results = {}
+
+        self.original_config.columns.cat_cols         = list(self.original_categorical_columns)
+        self.original_config.columns.cont_cols        = list(self.original_continuous_columns)
+
+        dataset_loader = DatasetLoader(dataframe=self.original_dataframe, cfg=self.original_config, logger=self.logger)
+        baseline_metrics = self.train(dataset_loader, self.original_config)
         
-        with torch.inference_mode():
-            model.eval()
-            val_metrics = trainer.evaluate(val_loader)
-            test_metrics = trainer.evaluate(test_loader)
-            trainer.logger.close()
+        features = self.original_categorical_columns + self.original_continuous_columns
+        
+        for feature in tqdm(features, desc="Ablating features", ncols=100):
+            short_dataframe, feature_type, short_config = self.remove_feature(feature, dataframe=self.original_dataframe, config=self.original_config)
+            
+            if short_dataframe is None:
+                if self.logger:
+                    self.logger.warning(f"Feature '{feature}' not found in either categorical or continuous columns. Skipping.")
+                continue
 
-        return val_metrics, test_metrics, num_params, run_dir
+            short_dataset_loader = DatasetLoader(dataframe=short_dataframe, cfg=short_config, logger=self.logger)
+            short_metrics = self.train(short_dataset_loader, short_config)
 
-    @staticmethod
-    def _row(
-        feature: str,
-        feature_type: str,
-        removed: bool,
-        val_metrics: Optional[Dict[str, float]],
-        test_metrics: Optional[Dict[str, float]],
-        num_params: Optional[int],
-        run_dir: Optional[str],
-        baseline_metric: Optional[float],
-        delta_metric: Optional[float],
-        metric: str,
-    ) -> Dict[str, Any]:
+            delta = baseline_metrics[metric] - short_metrics[metric]
 
-        val_metric = float(val_metrics[metric])
-       
-        return {
-            "feature": feature,
-            "feature_type": feature_type,
-            "removed": removed,
-            "num_params": num_params,
-            "run_dir": run_dir,
-            "baseline_metric": baseline_metric,
-            "val_metric": val_metric,
-            "delta_metric": delta_metric,
-            "val_metrics": val_metrics,
-            "test_metrics": test_metrics,
-        }
+            results[feature] = {
+                "feature_type": feature_type,
+                "val_metrics": short_metrics,
+                "delta_metric": delta
+            }
+
+        return results
+
 
