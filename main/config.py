@@ -22,7 +22,7 @@ class LoadParams:
     use_cache            : bool  = True
     sample_fraction      : float = 1.0
     load_sample_fraction : float = 0.01
-    user_sample_count    : int   = 6
+    user_sample_count    : int   = 60000
     random_state         : int   = 42
 
 
@@ -44,26 +44,38 @@ class TemporalFeatureParams:
 
 @dataclass
 class AugmentationParams:
-    temporal_cutout_ratio : float = 0.15
-    feature_dropout_ratio : float = 0.2
-    gaussian_noise_std    : float = 0.05
-    time_warp_probability : float = 0.1
+    temporal_cutout_ratio : float = 0.20
+    feature_dropout_ratio : float = 0.25
+    gaussian_noise_std    : float = 0.08
+    time_warp_probability : float = 0.15
+
+
+@dataclass
+class LayerWiseParams:
+    tokenizer_lr        : float = 1e-3
+    invoice_encoder_lr  : float = 5e-4
+    sequence_encoder_lr : float = 3e-4
+    cross_attention_lr  : float = 3e-4
+    head_lr             : float = 1e-3
 
 
 @dataclass
 class TrainingParams:
-    batch_size         : int   = 128
-    epochs             : int   = 20
-    lr                 : float = 1e-3
-    dropout            : float = 0.05
-    weight_decay       : float = 1e-4
+    batch_size         : int   = 256
+    epochs             : int   = 35
+    warmup_enabled     : bool  = True
+    warmup_steps       : int   = 1000
+    warmup_start_factor: float = 0.1
+    grad_accum_steps   : int   = 1
+    dropout            : float = 0.10
+    weight_decay       : float = 2e-4
     patience           : int   = 6
-    high_target_weight : float = 0.5
+    high_target_weight : float = 0.3
     mixed_precision    : bool  = True
-    max_grad_norm      : float = 3.0
-    num_workers        : int   = 0
+    max_grad_norm      : float = 1.0
+    num_workers        : int   = 8
     pin_memory         : bool  = True
-    persistent_workers : bool  = False
+    persistent_workers : bool  = True
     prefetch_factor    : int   = 4
     device             : str   = None
 
@@ -71,14 +83,14 @@ class TrainingParams:
 @dataclass
 class ArchitectureParams:
     max_seq_len                 : int   = 50
-    min_seq_len                 : int   = 10
+    min_seq_len                 : int   = 2
     hidden_dim                  : int   = 128
     num_attention_heads         : int   = 4
     num_invoice_encoder_layers  : int   = 1
-    num_sequence_encoder_layers : int   = 1
-    drop_path_rate              : float = 0.05
-    use_augmentation            : bool  = False
-    augment_prob                : float = 0.1
+    num_sequence_encoder_layers : int   = 3
+    drop_path_rate              : float = 0.10
+    use_augmentation            : bool  = True
+    augment_prob                : float = 0.25
     embedding_dropout           : float = 0.05
     periodic_sigma              : float = 1.0
     rotary_embedding_base       : float = 10000.0
@@ -87,15 +99,14 @@ class ArchitectureParams:
 
 
 @dataclass
-class SchedulerParams:
-    scheduler_mode     : str   = 'min'
-    scheduler_factor   : float = 0.5
-    scheduler_patience : int   = 3
+class CosineSchedulerParams:
+    t_max: int = None  
+    eta_min: float = 1e-6
 
 
 @dataclass
 class EMAParams:
-    use_ema                : bool  = False
+    use_ema                : bool  = True
     ema_decay              : float = 0.9999
     ema_warmup_steps       : int   = 2000
     ema_warmup_denominator : int   = 10
@@ -104,17 +115,17 @@ class EMAParams:
 @dataclass
 class OverfitParams:
     overfit_single_batch     : bool  = False
-    overfit_epochs           : int   = 1
-    overfit_patience         : int   = 1
+    overfit_epochs           : int   = 100
+    overfit_patience         : int   = 100
     overfit_dropout          : float = 0.0
     overfit_weight_decay     : float = 0.0
     overfit_number_of_users  : int   = 3
     overfit_min_length       : int   = 2
     overfit_test_size        : float = 0.3
     overfit_val_size         : float = 0.3
-    overfit_use_ema          : bool  = False
-    overfit_use_augmentation : bool  = False
-    overfit_mixed_precision  : bool  = False
+    overfit_use_ema          : bool  = True
+    overfit_use_augmentation : bool  = True
+    overfit_mixed_precision  : bool  = True
 
 
 @dataclass
@@ -194,7 +205,7 @@ class Columns:
     paid_value_col      : str = 'valor_pago_brl'
     security_deposit_col : str = 'valor_caucao_brl'
     
-    sort_cols: List[str] = field(default_factory=lambda: ['usuarioId', 'criacaoData', 'vencimentoData'])
+    sort_cols: List[str] = field(default_factory=lambda: ['usuarioId', 'vencimentoData', 'ordem_parcela'])
     group_cols: List[str] = field(default_factory=lambda: ['usuarioId'])
     
     delay_clipped_col: str = 'delay_clipped'
@@ -215,8 +226,9 @@ class Config:
     columns:      Columns = field(default_factory=Columns)
     training:     TrainingParams = field(default_factory=TrainingParams)
     architecture: ArchitectureParams = field(default_factory=ArchitectureParams)
+    layerwise:    LayerWiseParams = field(default_factory=LayerWiseParams)
     ema:          EMAParams = field(default_factory=EMAParams)
-    scheduler:    SchedulerParams = field(default_factory=SchedulerParams)
+    scheduler:    CosineSchedulerParams = field(default_factory=CosineSchedulerParams)
     overfit:      OverfitParams = field(default_factory=OverfitParams)
     ablation:     AblationParams = field(default_factory=AblationParams)
 

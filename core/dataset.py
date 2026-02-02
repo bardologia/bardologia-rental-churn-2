@@ -5,15 +5,21 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import GroupShuffleSplit
+import platform
 
 
 class Augmentation:
     def __init__(self, augmentation_params):
         self.params = augmentation_params
 
-    def temporal_cutout(self, categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
-        if probability is None:
-            probability = self.params.default_probability
+    def temporal_cutout(
+        self,
+        categorical_features: torch.Tensor,
+        continuous_features: torch.Tensor,
+        probability: float = None,
+        excluded_cont_indices: list = None,
+    ) -> tuple:
+      
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
 
@@ -21,25 +27,44 @@ class Augmentation:
         if sequence_length <= 1:
             return categorical_features, continuous_features
 
-        num_cutout = max(1, int(sequence_length * self.params.temporal_cutout_ratio))
-        cutout_indices = torch.randperm(sequence_length)[:num_cutout]
+        available_indices = list(range(sequence_length - 1))
+        if len(available_indices) == 0:
+            return categorical_features, continuous_features
+        
+        num_cutout = max(1, int((sequence_length - 1) * self.params.temporal_cutout_ratio))
+        num_cutout = min(num_cutout, len(available_indices))
+        cutout_indices = torch.tensor(available_indices, dtype=torch.long)[torch.randperm(len(available_indices))[:num_cutout]]
 
         categorical_augmented = categorical_features.clone()
-        continuous_augmented = continuous_features.clone()
+        continuous_augmented  = continuous_features.clone()
 
         categorical_augmented[cutout_indices] = 0
         continuous_augmented[cutout_indices] = 0.0
+        if excluded_cont_indices:
+            continuous_augmented[cutout_indices][:, excluded_cont_indices] = continuous_features[cutout_indices][:, excluded_cont_indices]
 
         return categorical_augmented, continuous_augmented
 
-    def feature_dropout(self, categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
-        if probability is None:
-            probability = self.params.default_probability
+    def feature_dropout(
+        self,
+        categorical_features: torch.Tensor,
+        continuous_features: torch.Tensor,
+        probability: float = None,
+        excluded_cont_indices: list = None,
+    ) -> tuple:
+
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
 
         categorical_augmented = categorical_features.clone()
         continuous_augmented = continuous_features.clone()
+        
+        last_t = categorical_features.shape[0] - 1
+        if last_t < 0:
+            return categorical_augmented, continuous_augmented
+        
+        categorical_last = categorical_features[last_t].clone()
+        continuous_last = continuous_features[last_t].clone()
 
         if categorical_features.shape[1] > 0:
             num_categorical_drop = max(1, int(categorical_features.shape[1] * self.params.feature_dropout_ratio))
@@ -47,25 +72,42 @@ class Augmentation:
             categorical_augmented[:, categorical_drop_indices] = 0
 
         if continuous_features.shape[1] > 0:
-            num_continuous_drop = max(1, int(continuous_features.shape[1] * self.params.feature_dropout_ratio))
-            continuous_drop_indices = torch.randperm(continuous_features.shape[1])[:num_continuous_drop]
-            continuous_augmented[:, continuous_drop_indices] = 0.0
+            excluded = set(excluded_cont_indices or [])
+            available_indices = [i for i in range(continuous_features.shape[1]) if i not in excluded]
+            if len(available_indices) > 0:
+                num_continuous_drop = max(1, int(len(available_indices) * self.params.feature_dropout_ratio))
+                perm = torch.randperm(len(available_indices))
+                continuous_drop_indices = torch.tensor(available_indices, device=continuous_features.device)[perm[:num_continuous_drop]]
+                continuous_augmented[:, continuous_drop_indices] = 0.0
+        
+        categorical_augmented[last_t] = categorical_last
+        continuous_augmented[last_t] = continuous_last
 
         return categorical_augmented, continuous_augmented
 
-    def gaussian_noise(self, continuous_features: torch.Tensor, probability: float = None, standard_deviation: float = None) -> torch.Tensor:
-        if probability is None:
-            probability = self.params.default_probability
+    def gaussian_noise(
+        self,
+        continuous_features: torch.Tensor,
+        probability: float = None,
+        standard_deviation: float = None,
+        excluded_cont_indices: list = None,
+    ) -> torch.Tensor:
+        
         if torch.rand(1) > probability:
             return continuous_features
 
-        std = standard_deviation if standard_deviation is not None else self.params.gaussian_noise_std
-        noise = torch.randn_like(continuous_features) * std
-        return continuous_features + noise
+        last_t = continuous_features.shape[0] - 1
+        continuous_augmented = continuous_features.clone()
+        
+        if last_t >= 0:
+            noise = torch.randn(last_t, continuous_features.shape[1], device=continuous_features.device) * standard_deviation
+            if excluded_cont_indices:
+                noise[:, excluded_cont_indices] = 0.0
+            continuous_augmented[:last_t] = continuous_features[:last_t] + noise
+        
+        return continuous_augmented
 
     def time_warp(self, categorical_features: torch.Tensor, continuous_features: torch.Tensor, probability: float = None) -> tuple:
-        if probability is None:
-            probability = self.params.time_warp_probability
         if torch.rand(1) > probability:
             return categorical_features, continuous_features
 
@@ -73,14 +115,20 @@ class Augmentation:
         if sequence_length <= 2:
             return categorical_features, continuous_features
 
+        available_indices = list(range(sequence_length - 1))
+        
         if torch.rand(1) > 0.5:
-            duplicate_index = torch.randint(0, sequence_length, (1,))[0]
+            if len(available_indices) == 0:
+                return categorical_features, continuous_features
+            duplicate_index = available_indices[torch.randint(0, len(available_indices), (1,))[0]]
             categorical_augmented = torch.cat([categorical_features[:duplicate_index+1], categorical_features[duplicate_index:]], dim=0)
-            continuous_augmented = torch.cat([continuous_features[:duplicate_index+1], continuous_features[duplicate_index:]], dim=0)
+            continuous_augmented  = torch.cat([continuous_features[:duplicate_index+1],  continuous_features[duplicate_index:]],  dim=0)
         else:
-            remove_index = torch.randint(0, sequence_length-1, (1,))[0]
+            if len(available_indices) == 0:
+                return categorical_features, continuous_features
+            remove_index = available_indices[torch.randint(0, len(available_indices), (1,))[0]]
             categorical_augmented = torch.cat([categorical_features[:remove_index], categorical_features[remove_index+1:]], dim=0)
-            continuous_augmented = torch.cat([continuous_features[:remove_index], continuous_features[remove_index+1:]], dim=0)
+            continuous_augmented  = torch.cat([continuous_features[:remove_index],  continuous_features[remove_index+1:]],  dim=0)
 
         return categorical_augmented, continuous_augmented
 
@@ -96,6 +144,7 @@ class SequentialDataset(Dataset):
         augment=False,
         mask_last_cont=None,
         last_known_idx=None,
+        protected_cont_indices=None,
         cfg=None,
     ):
         self.categorical_data = torch.as_tensor(categorical_data, dtype=torch.long)
@@ -109,6 +158,7 @@ class SequentialDataset(Dataset):
         self.logger = logger
         self.mask_last_cont = mask_last_cont or []
         self.last_known_idx = last_known_idx
+        self.protected_cont_indices = protected_cont_indices or []
 
         self.logger.section("Data Augmentation Configuration")
         if self.augment:
@@ -140,11 +190,31 @@ class SequentialDataset(Dataset):
         self.mask_target(continuous_features)
 
         if self.augment and self.training_mode and self.augmenter is not None:
-            categorical_features, continuous_features = self.augmenter.feature_dropout(categorical_features, continuous_features, probability=self.augment_probability)
+            categorical_features, continuous_features = self.augmenter.temporal_cutout(
+                categorical_features,
+                continuous_features,
+                probability=self.augment_probability,
+                excluded_cont_indices=self.protected_cont_indices,
+            )
+            
+            categorical_features, continuous_features = self.augmenter.feature_dropout(
+                categorical_features,
+                continuous_features,
+                probability=self.augment_probability,
+                excluded_cont_indices=self.protected_cont_indices,
+            )
+            
             continuous_features = self.augmenter.gaussian_noise(
                 continuous_features,
                 probability=self.augment_probability,
-                standard_deviation=(self.config.augmentation.gaussian_noise_std if (self.config is not None and self.config.augmentation is not None) else None),
+                standard_deviation=(self.config.augmentation.gaussian_noise_std),
+                excluded_cont_indices=self.protected_cont_indices,
+            )
+            
+            categorical_features, continuous_features = self.augmenter.time_warp(
+                categorical_features,
+                continuous_features,
+                probability=self.augment_probability,
             )
         
         self.mask_target(continuous_features)
@@ -176,6 +246,7 @@ class DatasetLoader:
         self.continuous_scalers   = {}
         self.target_scalers       = {}
         self.embedding_dimensions = []
+        self.categorical_maps     = {}
 
 
     def load_data(self, dataframe):
@@ -237,9 +308,8 @@ class DatasetLoader:
             dataframe[column] = label_encoder.fit_transform(dataframe[column]) + 1
             cardinality = len(label_encoder.classes_)
             self.embedding_dimensions.append(cardinality)
-            self.logger.info(
-                f"[Categorical Encoding] Column {column:<25} | cardinality={cardinality:6d}"
-            )
+            self.categorical_maps[column] = {str(cls): int(idx) + 1 for idx, cls in enumerate(label_encoder.classes_)}
+            self.logger.info(f"[Categorical Encoding] Column {column:<25} | cardinality={cardinality:6d}")
 
         self.logger.info(f"[Categorical Encoding] Encoded {len(self.categorical_columns)} categorical features \n")
         return dataframe
@@ -488,6 +558,7 @@ class DatasetLoader:
        
         mask_idxs.append(self.continuous_columns.index(self.config.columns.delay_clipped_col))
         known_idx = self.continuous_columns.index(self.config.columns.delay_is_known_col)
+        protected_cont_indices = [known_idx]
 
         train_indices,     validation_indices,     test_indices     = indices
         train_targets,     validation_targets,     test_targets     = targets
@@ -502,6 +573,7 @@ class DatasetLoader:
             augment=True,
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
+            protected_cont_indices=protected_cont_indices,
             cfg=self.config,
             logger = self.logger
         )
@@ -514,6 +586,7 @@ class DatasetLoader:
             augment =False,
             mask_last_cont =mask_idxs,
             last_known_idx =known_idx,
+            protected_cont_indices=protected_cont_indices,
             cfg =self.config,
             logger = self.logger
         )
@@ -526,6 +599,7 @@ class DatasetLoader:
             augment=False,
             mask_last_cont=mask_idxs,
             last_known_idx=known_idx,
+            protected_cont_indices=protected_cont_indices,
             cfg=self.config,
             logger = self.logger
         )
@@ -550,14 +624,20 @@ class DatasetLoader:
 
 
     def create_dataloaders(self, train_dataset, validation_dataset, test_dataset):
+        is_windows = platform.system() == 'Windows'
+        num_workers = 0 if is_windows else self.config.training.num_workers
+        use_persistent = num_workers > 0
+        
+        if is_windows and self.config.training.num_workers > 0:
+            self.logger.warning("[Dataloaders] Windows detected: Setting num_workers=0 to avoid multiprocessing issues")
 
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.config.training.batch_size,
             shuffle=True,
-            num_workers=self.config.training.num_workers,
+            num_workers=num_workers,
             pin_memory=self.config.training.pin_memory,
-            persistent_workers=self.config.training.num_workers > 0,
+            persistent_workers=use_persistent,
             collate_fn=self.collate_sequences
         )
 
@@ -565,9 +645,9 @@ class DatasetLoader:
             validation_dataset,
             batch_size=self.config.training.batch_size,
             shuffle=False,
-            num_workers=self.config.training.num_workers,
+            num_workers=num_workers,
             pin_memory=self.config.training.pin_memory,
-            persistent_workers=self.config.training.num_workers > 0,
+            persistent_workers=use_persistent,
             collate_fn=self.collate_sequences
         )
 
@@ -575,9 +655,9 @@ class DatasetLoader:
             test_dataset,
             batch_size=self.config.training.batch_size,
             shuffle=False,
-            num_workers=self.config.training.num_workers,
+            num_workers=num_workers,
             pin_memory=self.config.training.pin_memory,
-            persistent_workers=self.config.training.num_workers > 0,
+            persistent_workers=use_persistent,
             collate_fn=self.collate_sequences
         )
 

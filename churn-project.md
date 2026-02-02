@@ -1,6 +1,6 @@
 # Rental Churn Prediction Project: Comprehensive Technical Deep Dive
 
-## 1. Executive Summary
+## 0. Executive Summary
 
 This project implements a state-of-the-art deep learning system for predicting **rental payment behavior** (churn/delays). It treats the problem as a **temporal sequence regression** task: predicting the `target_days_to_payment` for a specific invoice given the history of previous invoices and the metadata of the current one.
 
@@ -11,6 +11,116 @@ The architecture is a hybrid Hierarchical Transformer that combines:
 4.  **Temporal Cross-Attention** to dynamically link current static features with historical behavioral patterns.
 
 This document details the exact mechanisms, mathematics, and engineering decisions behind every component.
+
+## 1. raw_data
+
+This table (`raw_data`) consolidates all financial events associated with a single rent installment, unifying the principal amounts, surcharges, and discounts.  
+The granularity is **one financial item per row** (whether the installment principal, a late fee, a discount, etc.), enabling a detailed statement view for each installment.  
+The table is designed for financial analytics such as **accounts receivable tracking**, **payment performance**, **revenue recognition**, and **accounting reconciliation**.
+
+## Columns
+
+| Column | Description |
+|---|---|
+| sexo | Customer gender (e.g., "Masculino", "Feminino"). |
+| valor_caucao_segunda_parcela_brl | Value of the second security deposit installment in BRL, if applicable. |
+| usuarioDescontoTipoId | Code identifying the granted discount type (e.g., 9 for "Desconto de Caução"). |
+| valor_mxn | Financial item value in Mexican Pesos (MXN). Discount values are represented with a negative sign. |
+| vencimentoDia | Installment due day. |
+| ordem_parcela | Descending order of the installment within the rental cycle, based on due date. The most recent installment has value 1. |
+| situacao | Numeric code for the installment payment status (e.g., 0 for "A Vencer", 10 for "Pago", 30 for "Cancelada"). |
+| acrescimo_elegivel_cashback | Flag (1 = yes, 0 = no) indicating whether the surcharge amount is eligible for cashback generation. |
+| Dias_atraso | Calculates the number of days late for an installment payment by comparing payment date vs. due date. A positive value indicates late payment, 0 indicates payment on the due date, and -1 is used for all early payments regardless of how many days in advance. |
+| parcelaId | Unique identifier of the rent installment, used to group principal value, surcharges, and discounts. |
+| nome_usuario | Customer full name. |
+| locacaoCicloId | Unique identifier of the rental cycle. A contract can have multiple cycles (renewals). |
+| pacoteId | Unique identifier of the contracted rental package. |
+| pacoteTipoId | Identifier of the rental package type. |
+| veiculoEventoMultaId | Identifier of the traffic fine or vehicle event that originated the charge. |
+| adyenPspReferencePagamento | Unique identifier of the payment transaction at the payment service provider (PSP), such as Adyen. |
+| ContaCorrenteOmie | Description of the bank/current account in the Omie ERP where the payment was settled. |
+| categoria_acrescimos | Subcategory detailing the nature of a surcharge or discount (e.g., "aluguel", "multa_cancelamento", "acrescimos_caucao"). |
+| pais | Country where the rental occurred (e.g., "Brasil"). |
+| usuarioMovimentoCaucaoTipoId | Code identifying the type of security deposit movement (e.g., 9 for "Pagamento de Parcela com Caução"). |
+| usuarioMovimentoCaucaoOrigemId | ID of the original security deposit movement that originated this surcharge. |
+| vencimentoData | Installment due date. |
+| competenciaInicioData | Start date of the accrual/competence period the installment refers to. |
+| emissaoNotaFiscalDia | Day the service invoice (NFSe) was issued. |
+| regiaoId | Unique identifier of the region/state where the rental occurred. |
+| produto | Name of the contracted rental product/plan (e.g., "Plano Minha Mottu"). |
+| manutencaoItemServicoInsumoId | Identifier of the input/part used in the maintenance service. |
+| valor_recebiveis | BRL value of the item considered as receivable revenue, excluding contract cancellation fines and security deposit movements. |
+| atualizacao_dt | Datetime of the last update of the record in the data source. |
+| parcelaTipoId | Identifier code for the installment type (e.g., 2 for "Semanal", 4 for "Multa_cancelamento"). |
+| servicoId | Identifier of the maintenance service performed. |
+| valor_caucao_entrada_brl | Value of the security deposit down payment, in BRL. |
+| departamento_omie_erp | Department in Omie ERP to which the installment revenue is attributed. |
+| paisId | Unique identifier of the country where the rental occurred. |
+| regiao | State/region where the rental occurred (e.g., "SP"). |
+| codigoOSOmie | Service Order code in Omie ERP associated with the installment. |
+| parcelas_pagamento_caucao_qtd | Number of installments into which the security deposit payment was split. |
+| competenciaFimData | End date of the accrual/competence period the installment refers to. |
+| parcelaTipo | Describes the main installment type, such as "Semanal", "Quinzenal", or "Adesão". |
+| formaPagamento | Payment method used for the installment (e.g., "Cartão de Crédito", "PIX", "Caucao"). |
+| codigoCategoriaOmie | Financial category code in Omie ERP, used for accounting purposes. |
+| valor_a_receber_bruto | Gross value of receivable items (excluding contract cancellation fines and security deposit movements) that are either pending payment ("A Vencer") or were settled using the customer’s security deposit balance. |
+| criacaoData | Datetime when the installment record was created. |
+| formaPagamentoId | Unique identifier of the payment method. |
+| criacaoDia | Day when the installment record was created. |
+| usuarioDescontoId | Unique identifier of the applied discount. |
+| descricaoCategoriaOmie | Description of the financial category in Omie ERP (e.g., "Receita de Aluguel"). |
+| manutencaoInsumoNome | Name of the input (part/material) used in the maintenance that generated the charge. |
+| forma_pagamento_caucao | Indicates how the security deposit was paid (e.g., "À vista", "Parcelado"). |
+| valor_dia_mxn | Daily rent value in MXN, calculated from the installment value. |
+| valor_nf_mxn | Invoice amount issued for the installment, in MXN. |
+| valor_pago_brl | Total amount effectively paid for the installment in BRL. |
+| lugar | City where the rental occurred (e.g., "São Paulo"). |
+| pacoteDuracao | Numeric duration of the package in the unit defined by `pacoteDuracaoTipoId`. |
+| categoria | High-level classification of the financial item. Possible values: "Aluguel", "Multa_cancelamento", "Acrescimos", "Descontos". |
+| pagamentoDia | Day when the installment payment was made. |
+| valor_caucao_parcelado_brl | Total security deposit value if paid in installments, in BRL. |
+| produto_categoria_duracao | Duration associated with the product category (e.g., "Anual"). |
+| faixa_idade_resumida | Customer age range (e.g., "26-35"). |
+| valor_dia_brl | Daily rent value in BRL, calculated from the installment value. |
+| servicoDescricao | Description of the maintenance service that generated the charge. |
+| pacoteNome | Name of the contracted rental package. |
+| situacao_descricao | Text description of the installment payment status (e.g., "A Vencer", "Pago", "Cancelada"). |
+| valor_receita_quebra_de_contrato | Amount related to the contract cancellation fine that has been effectively paid by the customer. |
+| numero | Sequential installment number within the rental cycle (e.g., 1, 2, 3). |
+| pacoteTipoDescricao | Description of the rental package type (e.g., "Semanal", "Anual"). |
+| valor_a_receber_pos_caucao_liquido | Total value of receivable items (excluding contract cancellation fines and security deposit movements) that are in status "A Vencer", representing what still needs to be paid by the customer using means other than the security deposit. |
+| veiculo_modelo | Rented vehicle model (e.g., "Mottu Sport"). |
+| criacaoDataAcrescimoDesconto | Datetime when the surcharge/discount record was created, when applicable. |
+| manutencaoId | Identifier of the maintenance service order that originated the charge. |
+| valor_pago_mxn | Total amount effectively paid for the installment in MXN. |
+| produto_categoria | Category of the contracted product (e.g., "Aluguel"). |
+| valor_caucao_mxn | Total contracted security deposit value for the rental, in MXN. |
+| lugarId | Unique identifier of the city where the rental occurred. |
+| valor_nf_brl | Invoice amount issued for the installment, in BRL. |
+| houve_parcelamento | Flag (1 = yes, 0 = no) indicating whether the charge was subject to an installment plan. |
+| usuarioId | Unique identifier of the customer (tenant). |
+| quantidadeDiarias | Number of daily units covered by the installment. |
+| pagamentoData_UTC | Datetime when the installment payment was made, in UTC. |
+| usuarioMovimentoCaucaoId | Identifier of the security deposit movement, if the item is related to using the customer’s security deposit balance. |
+| pagamentoData | Datetime when the installment payment was made, in local timezone. |
+| locacaoId | Unique identifier of the rental contract. |
+| parcelaRetirada | Flag (1 = yes, 0 = no) indicating whether this installment refers to vehicle pickup. |
+| manutencaoInsumoId | Unique identifier of the input (part/material) used in a maintenance. |
+| numeroNFSeOmie | Electronic Service Invoice (NFSe) number in Omie ERP. |
+| emissaoNotaFiscalData | Issue date of the NFSe associated with the installment. |
+| parcelamentoDistribuicaoId | Identifier of the installment distribution, if the original charge was split. |
+| referenciaExternaId | External reference identifier associated with surcharges, such as a fine ID in a third-party system. |
+| recorrencia_pagamento | Indicates payment recurrence (e.g., "Semanal"). |
+| codigoMulta | Traffic violation code, when applicable. |
+| valor_caucao_brl | Total contracted security deposit value for the rental, in BRL. |
+| contaCorrenteBaixaOmie | Current account code in Omie ERP where the payment was settled. |
+| manutencaoItemId | Identifier of the specific item within a maintenance service order. |
+| situacao_locacao | Numeric code representing the current status of the rental contract (e.g., 20 for "Ativa"). |
+| valor_brl | Financial item value in BRL. Discount values are represented with a negative sign. |
+| tipo_valor | Classifies the origin of the value. For rent, it reflects the installment type (e.g., "Semanal", "Quinzenal"). For other items, it specifies the nature of the charge/discount (e.g., "Multa Atraso", "Desconto Cupom", "Manutenção"). |
+| valor_caucao_a_vista_brl | Total security deposit value if paid upfront, in BRL. |
+| pacoteDuracaoTipoId | Identifier of the package duration type (e.g., days, months, years). |
+| moeda | Currency symbol used in transactions (e.g., "BRL", "MXN"). |
 
 ---
 
@@ -249,3 +359,4 @@ The target variable flows through a rigorous transformation pipeline to ensure n
 We don't just project continuous features into high dimensions; we **gate** them.
 -   **Code**: `gated = sigmoid(GateLayer(fourier_feats))`
 -   **Why**: Some continuous features might be noise for specific invoices. The gating mechanism allows the network to suppress (multiply by ~0) specific frequency components or entire features dynamically, acting as a learned feature selector.
+

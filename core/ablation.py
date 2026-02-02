@@ -85,7 +85,7 @@ class FeatureAblation:
             device=trainer.device
         )
 
-        val_results   = evaluator.run(validation_loader)
+        val_results   = evaluator.run(validation_loader, make_plots=False)
         val_metrics   = val_results['metrics']
    
         return val_metrics

@@ -6,6 +6,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import torch
 import numpy as np
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -36,8 +37,10 @@ def train(config, use_cache, save_cache, save_results=False):
     
     state_dict_path = os.path.join(run_dir, "model_state_dict.pt")
     metadata_path   = os.path.join(run_dir,"model_metadata.pt")
+    plots_dir = os.path.join(run_dir, "plots")
     
     os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
     os.makedirs(os.path.dirname(state_dict_path), exist_ok=True)
     os.makedirs(os.path.dirname(metadata_path),   exist_ok=True)
 
@@ -105,13 +108,15 @@ def train(config, use_cache, save_cache, save_results=False):
   
     evaluator = Results(
         model=trained_model,
-        device=trainer.device
+        device=trainer.device,
     )
 
     train_results = evaluator.run(train_loader)
     val_results   = evaluator.run(validation_loader)
-    test_results  = evaluator.run(test_loader)
-
+    
+    test_results  = evaluator.run(test_loader, make_plots=True)
+    test_plots   = test_results.get('plots', {})
+       
     train_metrics = train_results['metrics']
     val_metrics   = val_results['metrics']
     test_metrics  = test_results['metrics']
@@ -134,18 +139,55 @@ def train(config, use_cache, save_cache, save_results=False):
         "target_scaler"        : trained_model.target_scaler,
         "feature_scaler"       : trained_model.feature_scaler,
         "config"               : trained_model.config,
+        "categorical_maps"      : dataset_loader.categorical_maps,
     }
+
+    torch.save(metadata, metadata_path)
+    logger.info(f"[Checkpoint] Saved metadata to: {metadata_path}")
 
     if save_results:
         torch.save(trained_model.state_dict(), state_dict_path)
         logger.info(f"[Checkpoint] Saved state_dict to: {state_dict_path}")
         torch.save(metadata, metadata_path)
         logger.info(f"[Checkpoint] Saved metadata to: {metadata_path}")
+        
+        for name, fig in test_plots.items():
+            png_path = os.path.join(plots_dir, f"test_{name}.png")
+            svg_path = os.path.join(plots_dir, f"test_{name}.svg")
+            fig.savefig(png_path, bbox_inches='tight')
+            fig.savefig(svg_path, bbox_inches='tight')
+            logger.info(f"[Plots] Saved plot: {png_path}")
   
     logger.close()
     return trained_model, metadata, train_metrics, val_metrics, test_metrics
 
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
+    import argparse
     from main.config import config
-    trained_model, metadata, train_metrics, val_metrics, test_metrics = train(config, use_cache=True, save_cache=True, save_results=True)
+
+    parser = argparse.ArgumentParser(description="Train model for rental churn")
+    parser.add_argument("--use-cache", dest="use_cache", action="store_true", help="Load preprocessed training data from cache")
+    parser.add_argument("--no-cache", dest="use_cache", action="store_false", help="Do not use cached training data")
+    parser.set_defaults(use_cache=True)
+
+    parser.add_argument("--save-cache", dest="save_cache", action="store_true", help="Save processed training data to cache")
+    parser.set_defaults(save_cache=False)
+
+    parser.add_argument("--save-results", dest="save_results", action="store_true", help="Save model state and metadata")
+    parser.set_defaults(save_results=False)
+
+    parser.add_argument("--overfit", dest="overfit", action="store_true", help="Enable overfit-single-batch mode using config.overfit settings")
+    parser.set_defaults(overfit=False)
+
+    args = parser.parse_args()
+
+    if args.overfit:
+        config.overfit.overfit_single_batch = True
+
+    trained_model, metadata, train_metrics, val_metrics, test_metrics = train(
+        config,
+        use_cache=args.use_cache,
+        save_cache=args.save_cache,
+        save_results=args.save_results,
+    )

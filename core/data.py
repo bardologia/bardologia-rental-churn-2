@@ -101,6 +101,7 @@ class FeatureEngineer:
         dataframe = (dataframe
             .sort_values(sort_cols)
             .groupby(user_col, group_keys=False)
+            [[user_col] + [c for c in dataframe.columns if c != user_col]]
             .apply(process_user_history)
             .reset_index(drop=True)
         )

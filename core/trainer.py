@@ -1,14 +1,56 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.metrics import mean_absolute_percentage_error, median_absolute_error
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import median_absolute_error
 import numpy as np
 import itertools
 import copy
 from tqdm.auto import tqdm
+
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module) -> None:
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.backup[name] = param.detach().clone()
+            param.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": self.shadow,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = state.get("decay", self.decay)
+        self.shadow = state.get("shadow", self.shadow)
+        self.backup = {}
 
 
 class Trainer: 
@@ -32,17 +74,38 @@ class Trainer:
         self.target_scaler     = target_scaler
     
         self.high_target_weight = self.config.training.high_target_weight
+        self.logger.info(f"[High Target Weight] Weight: {self.high_target_weight}\n")
   
         self.criterion = nn.SmoothL1Loss(reduction='none')
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.training.lr, weight_decay=self.config.training.weight_decay)
         self.scaler    = GradScaler() if self.config.training.mixed_precision else None
 
-        self.scheduler = ReduceLROnPlateau(
+        self.layerwise_optimizer()
+
+        self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        self.warmup_enabled = self.config.training.warmup_enabled
+        self.warmup_steps = self.config.training.warmup_steps
+        self.warmup_start_factor = self.config.training.warmup_start_factor
+        self.warmup_finished = False
+        self.grad_accum_steps = max(1, self.config.training.grad_accum_steps)
+        self.logger.info(f"[Grad Accumulation] Effective batch size: {self.train_loader.batch_size * self.grad_accum_steps}\n")
+
+        if self.warmup_enabled and self.warmup_steps > 0:
+            self.apply_warmup_factor(self.warmup_start_factor)
+            self.logger.info(f"[Warmup] Enabled: {self.warmup_enabled}, Steps: {self.warmup_steps}, Start Factor: {self.warmup_start_factor}")
+            
+        self.scheduler = CosineAnnealingLR(
             self.optimizer,
-            mode=self.config.scheduler.scheduler_mode,
-            factor=self.config.scheduler.scheduler_factor,
-            patience=self.config.scheduler.scheduler_patience,
+            T_max=self.config.training.epochs if self.config.scheduler.t_max is None else self.config.scheduler.t_max,
+            eta_min=self.config.scheduler.eta_min,
         )
+        
+        self.logger.info(f"[Scheduler] CosineAnnealingLR with T_max={self.config.training.epochs if self.config.scheduler.t_max is None else self.config.scheduler.t_max}, eta_min={self.config.scheduler.eta_min}\n")
+
+        self.ema_enabled = self.config.ema.use_ema
+        self.ema = EMA(self.model, decay=self.config.ema.ema_decay) if self.ema_enabled else None
+        self.ema_warmup_steps = self.config.ema.ema_warmup_steps
+        self.ema_warmup_denominator = self.config.ema.ema_warmup_denominator
+        self.logger.info(f"[EMA] Enabled: {self.ema_enabled}, Decay: {self.config.ema.ema_decay}, Warmup Steps: {self.ema_warmup_steps}\n")
         
         self.global_step = 0
         self.checkpoint = None
@@ -70,6 +133,27 @@ class Trainer:
 
         self.logger.info("")
 
+    def layerwise_optimizer(self) -> None:
+        layerwise = self.config.layerwise
+        param_groups = []
+        
+        lr_map = {
+            "tokenizer": layerwise.tokenizer_lr,
+            "invoice_encoder": layerwise.invoice_encoder_lr,
+            "sequence_encoder": layerwise.sequence_encoder_lr,
+            "temporal_attention": layerwise.cross_attention_lr,
+            "head_days": layerwise.head_lr,
+        }
+        
+        for module_name, lr in lr_map.items():
+            module = getattr(self.model, module_name, None)
+            param_groups.append({"params": module.parameters(), "lr": lr})
+     
+        self.optimizer = optim.AdamW(param_groups, weight_decay=self.config.training.weight_decay)
+        self.logger.info(f"[Optimizer] Configured layer-wise learning rates:")
+        for module_name, lr in lr_map.items():
+            self.logger.info(f" [{module_name}] : {lr}'")
+
     def weighted_loss(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         losses = self.criterion(preds, targets).view(-1)
 
@@ -82,20 +166,52 @@ class Trainer:
             return weighted.mean()
 
         return losses.mean()
-              
-    def backward(self, loss):
+
+    def apply_warmup_factor(self, factor: float) -> None:
+        for i, group in enumerate(self.optimizer.param_groups):
+            group['lr'] = self.base_lrs[i] * factor
+
+    def apply_warmup(self) -> None:
+        if not self.warmup_enabled or self.warmup_steps <= 0:
+            return
+
+        step_num = self.global_step + 1
+        if step_num <= self.warmup_steps:
+            progress = step_num / self.warmup_steps
+            factor = self.warmup_start_factor + (1.0 - self.warmup_start_factor) * progress
+            self.apply_warmup_factor(factor)
+        elif not self.warmup_finished:
+            self.apply_warmup_factor(1.0)
+            self.warmup_finished = True
+
+    def update_ema(self) -> None:
+        if not self.ema_enabled or self.ema is None:
+            return
+        if self.global_step < self.ema_warmup_steps:
+            return
+        self.ema.update(self.model)
+   
+    def backward(self, loss, step: bool):
         if self.scaler:
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
-            self.scaler.step(self.optimizer)   
-            self.scaler.update()
+            if step:
+                self.apply_warmup()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
+                self.update_ema()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
-            self.optimizer.step()
-
-        self.global_step += 1
+            if step:
+                self.apply_warmup()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
+                self.update_ema()
 
     def train_epoch(self, epoch=None):
         self.model.train()
@@ -109,7 +225,8 @@ class Trainer:
         else:
             loop = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
 
-        for batch in loop:
+        self.optimizer.zero_grad(set_to_none=True)
+        for batch_idx, batch in enumerate(loop):
             categorical_features, continuous_features, targets, lengths = batch
 
             categorical_features = categorical_features.to(self.device, non_blocking=True)
@@ -117,15 +234,16 @@ class Trainer:
             targets              = targets.to(self.device, non_blocking=True)
             lengths              = lengths.to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad(set_to_none=True)
-
             with autocast(device_type=self.device.type, enabled=self.config.training.mixed_precision):
                 preds         = self.model(categorical_features, continuous_features, lengths)
                 target_tensor = targets.view(-1)
-                loss          = self.weighted_loss(preds, target_tensor)
+                raw_loss      = self.weighted_loss(preds, target_tensor)
+                loss          = raw_loss / self.grad_accum_steps
 
-            self.backward(loss)
-            running_loss += loss.detach()
+            is_last = (batch_idx + 1) == len(self.train_loader)
+            should_step = ((batch_idx + 1) % self.grad_accum_steps == 0) or is_last
+            self.backward(loss, step=should_step)
+            running_loss += raw_loss.detach()
             num_batches += 1
         
         average_loss = (running_loss / max(num_batches, 1)).item()    
@@ -172,25 +290,53 @@ class Trainer:
             'max_error': max_error,
             'loss': average_loss,
             
-            '0_5': error_bin_0_5,
-            '5_10': error_bin_5_10,
-            '10_15': error_bin_10_15,
-            '15_20': error_bin_15_20,
-            '20_25': error_bin_20_25,
-            'above_25': error_bin_above_25,
+            'error_0_5': error_bin_0_5,
+            'error_5_10': error_bin_5_10,
+            'error_10_15': error_bin_10_15,
+            'error_15_20': error_bin_15_20,
+            'error_20_25': error_bin_20_25,
+            'error_above_25': error_bin_above_25,
     
-            '0_5': mean_target_range(0, 5),
-            '5_10': mean_target_range(5, 10),
-            '10_15': mean_target_range(10, 15),
-            '15_20': mean_target_range(15, 20),
-            '20_25': mean_target_range(20, 25),
-            'above_25': mean_target_range(25, 30),
+            'target_0_5': mean_target_range(0, 5),
+            'target_5_10': mean_target_range(5, 10),
+            'target_10_15': mean_target_range(10, 15),
+            'target_15_20': mean_target_range(15, 20),
+            'target_20_25': mean_target_range(20, 25),
+            'target_above_25': mean_target_range(25, 30),
         }
         
         return metrics
 
+    def save_checkpoint(self, metrics: dict = None) -> None:
+        if not self.logger or not getattr(self.logger, "log_dir", None):
+            return
+
+        os.makedirs(self.logger.log_dir, exist_ok=True)
+        checkpoint_path = os.path.join(self.logger.log_dir, "checkpoint.pt")
+
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+            "ema_state_dict": self.ema.state_dict() if self.ema else None,
+            "global_step": self.global_step,
+            "best_metrics": metrics if metrics is not None else {},
+            "config": self.config,
+            "embedding_dimensions": getattr(self.model, "embedding_dimensions", None),
+            "num_continuous": getattr(self.model, "num_continuous", None),
+            "target_scaler": getattr(self.model, "target_scaler", None),
+            "feature_scaler": getattr(self.model, "feature_scaler", None),
+        }
+
+        torch.save(checkpoint, checkpoint_path)
+        self.logger.info(f"[Checkpoint] Saved checkpoint to: {checkpoint_path}")
+
     @torch.no_grad()
     def evaluate(self, loader):
+        if self.ema_enabled and self.ema is not None:
+            self.ema.apply_to(self.model)
+        
         all_preds = []
         all_targets = []
         running_loss = torch.tensor(0.0, device=self.device)
@@ -223,7 +369,8 @@ class Trainer:
         den_targets = np.clip(den_targets, 0, None)
 
         metrics = self.compute_metrics(den_targets, den_preds, average_loss)
-        
+        if self.ema_enabled and self.ema is not None:
+            self.ema.restore(self.model)
         return metrics
     
     def fit(self):
@@ -241,7 +388,7 @@ class Trainer:
             validation_metrics = self.evaluate(self.validation_loader)
             validation_rmse    = validation_metrics['rmse']
             
-            self.scheduler.step(validation_rmse)
+            self.scheduler.step()
             
             self.logger.info(
                 f"Epoch {epoch}:\n"
@@ -250,6 +397,9 @@ class Trainer:
                 f"  MAE        = {validation_metrics['mae']:.4f} | RMSE = {validation_rmse:.4f}\n"
                 f"  R2         = {validation_metrics['r2']:.4f} | StdErr = {validation_metrics['std']:.4f}\n"
                 f"  P50 = {validation_metrics['p50']:.4f} | P90 = {validation_metrics['p90']:.4f} | P95 = {validation_metrics['p95']:.4f} \n"
+                f"  MedAE     = {validation_metrics['medae']:.4f} | MaxErr = {validation_metrics['max_error']:.4f}\n"
+                f"error bins (%): [0-5]={validation_metrics['error_0_5']:.2f}, [5-10]={validation_metrics['error_5_10']:.2f}, [10-15]={validation_metrics['error_10_15']:.2f}, [15-20]={validation_metrics['error_15_20']:.2f}, [20-25]={validation_metrics['error_20_25']:.2f}, >25={validation_metrics['error_above_25']:.2f}\n"
+                f"target bins (MAE): [0-5]={validation_metrics['target_0_5']:.4f}, [5-10]={validation_metrics['target_5_10']:.4f}, [10-15]={validation_metrics['target_10_15']:.4f}, [15-20]={validation_metrics['target_15_20']:.4f}, [20-25]={validation_metrics['target_20_25']:.4f}, >25={validation_metrics['target_above_25']:.4f}\n"
             )
             
             if validation_rmse < best_rmse:
@@ -257,6 +407,7 @@ class Trainer:
                 best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 self.logger.info(f" New Best Model: RMSE={validation_rmse:.4f}")
+                self.save_checkpoint(validation_metrics)
             else:
                 patience_counter += 1
                 if patience_counter >= self.config.training.patience:
@@ -265,6 +416,5 @@ class Trainer:
         
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
-           
+
         return self.model
-    
